@@ -128,12 +128,105 @@ class SymmetricGridAligner:
 
 
 class RobustGridAligner:
-    """
-    Estimates all chamber bounding boxes from a single user-drawn first ROI (CH 1, top-left),
-    adapting to arbitrary row counts, column counts, center dividers, and mechanical tilt.
-    """
-class RobustGridAligner:
+    @classmethod
+    def snap_all_boxes(
+        cls,
+        frame_bgr: np.ndarray,
+        boxes: List[List[int]],
+        rows: int = 4,
+        cols: int = 2
+    ) -> List[List[int]]:
+        """
+        基于 1D 亮度投影与隔缝极小值对已有 boxes 进行精准微调吸附：
+        1. 纵向（Y轴）：利用管腔亮带与上下暗缝的阶跃精确定位管顶与管底；
+        2. 横向（X轴）：列内中位数严格共线，杜绝单行漂移与宽度发散；
+        3. 严格禁止向外膨胀超出原始框。
+        """
+        if frame_bgr is None or not boxes:
+            return boxes
 
+        img_h, img_w = frame_bgr.shape[:2]
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY) if frame_bgr.ndim == 3 else frame_bgr
+        n_boxes = len(boxes)
+
+        refined_boxes = []
+
+        # -----------------------------------------------------------
+        # 1. 逐个 Box 纵向（Y轴）内壁吸附
+        # -----------------------------------------------------------
+        for i in range(n_boxes):
+            bx1, by1, bx2, by2 = [int(v) for v in boxes[i]]
+            bw = bx2 - bx1
+            bh = by2 - by1
+
+            # 取纯净中段（避开端头加药孔和左侧刻度），提取纵向亮度剖面
+            core_x1 = max(0, bx1 + int(bw * 0.25))
+            core_x2 = min(img_w, bx1 + int(bw * 0.65))
+
+            if core_x2 > core_x1 and bh > 10:
+                # 垂直方向在当前框上下适度延展一点（±15%）观察完整的黑-白-黑分布
+                pad_y = int(bh * 0.15)
+                roi_y1 = max(0, by1 - pad_y)
+                roi_y2 = min(img_h, by2 + pad_y)
+
+                strip = gray[roi_y1:roi_y2, core_x1:core_x2]
+                vert_prof = np.mean(strip, axis=1)
+                # 平滑曲线
+                smooth_prof = cv2.GaussianBlur(vert_prof.reshape(-1, 1), (1, 9), 0).ravel()
+
+                # 求一阶梯度寻找上下黑白交界边缘
+                grad_y = np.gradient(smooth_prof)
+
+                # 上边界：寻找进入管腔的上升沿（梯度最大正值）
+                # 搜索范围锁定在当前 by1 对应局部区域的 ±12px 内
+                local_by1 = by1 - roi_y1
+                s_top_1 = max(0, local_by1 - 12)
+                s_top_2 = min(len(grad_y), local_by1 + 15)
+                if s_top_2 > s_top_1:
+                    ny1 = roi_y1 + s_top_1 + int(np.argmax(grad_y[s_top_1:s_top_2]))
+                else:
+                    ny1 = by1
+
+                # 下边界：寻找离开管腔的下降沿（梯度最大负值，即 -grad_y 最大）
+                local_by2 = by2 - roi_y1
+                s_bot_1 = max(0, local_by2 - 15)
+                s_bot_2 = min(len(grad_y), local_by2 + 12)
+                if s_bot_2 > s_bot_1:
+                    ny2 = roi_y1 + s_bot_1 + int(np.argmin(grad_y[s_bot_1:s_bot_2]))
+                else:
+                    ny2 = by2
+
+                # 保护：严禁向外膨胀超过原始框 2px，防止越吸越大
+                final_y1 = max(by1 - 1, ny1)
+                final_y2 = min(by2 + 1, ny2)
+
+                # 高度健康度校验
+                if (final_y2 - final_y1) < 15:
+                    final_y1, final_y2 = by1, by2
+            else:
+                final_y1, final_y2 = by1, by2
+
+            refined_boxes.append([bx1, int(final_y1), bx2, int(final_y2)])
+
+        # -----------------------------------------------------------
+        # 2. 横向（X轴）网格刚性约束：整列严格共线对齐
+        # -----------------------------------------------------------
+        for c in range(cols):
+            # 获取当前列的所有框索引
+            col_indices = [c * rows + r for r in range(rows) if (c * rows + r) < n_boxes]
+            if not col_indices:
+                continue
+
+            # 使用中位数对齐整列的 X1 和 X2，彻底消除单行（如第2行）偏离
+            med_x1 = int(np.median([refined_boxes[idx][0] for idx in col_indices]))
+            med_x2 = int(np.median([refined_boxes[idx][2] for idx in col_indices]))
+
+            for idx in col_indices:
+                refined_boxes[idx][0] = med_x1
+                refined_boxes[idx][2] = med_x2
+
+        return refined_boxes
+    
     @staticmethod
     def estimate_chambers_from_first_roi(
         frame_bgr: np.ndarray,
@@ -142,91 +235,137 @@ class RobustGridAligner:
         cols: int = 2,
         order: str = "column_first"
     ) -> List[Tuple[int, int, int, int]]:
+        """
+        基于第一个腔室(CH1)推断全阵列腔室。
+        采用纯净带垂直/水平投影定位，杜绝模板匹配平台效应与累积漂移。
+        具备百分之百返回非空列表的保底保障。
+        """
+        if frame_bgr is None or len(first_box) != 4:
+            return []
+
         img_h, img_w = frame_bgr.shape[:2]
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY) if frame_bgr.ndim == 3 else frame_bgr
 
-        x1, y1, x2, y2 = first_box
-        box_w = x2 - x1
-        box_h = y2 - y1
+        x1, y1, x2, y2 = [int(v) for v in first_box]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(img_w, x2), min(img_h, y2)
+        box_w = max(20, x2 - x1)
+        box_h = max(15, y2 - y1)
 
         # -----------------------------------------------------------
-        # 1. 垂直方向（Y轴）：利用 CH1 模板锁定 4 行试管的绝对行中心
+        # 0. 几何理论默认值（保底安全基线）
         # -----------------------------------------------------------
-        # 取 CH1 内部作为模板（避开边缘反光）
-        tpl_margin_y = int(box_h * 0.15)
-        tpl_y = gray[y1 + tpl_margin_y : y2 - tpl_margin_y, x1:x2]
+        # 图像中管间缝隙约为 20~30px，行跨度一般约为管高的 1.10 ~ 1.15 倍
+        fallback_pitch_y = int(box_h * 1.12)
+        fallback_col2_gap = int(box_w * 0.05)  # 两列中间中缝估算
 
-        # 仅在左侧列所在的垂直带内搜索
-        res_y = cv2.matchTemplate(gray[:, x1:x2], tpl_y, cv2.TM_CCOEFF_NORMED)
-        y_corr = np.max(res_y, axis=1)
+        try:
+            # -------------------------------------------------------
+            # 1. 垂直方向（Y轴）：利用管身亮带中心投影锁定全局周期行距
+            # -------------------------------------------------------
+            # 仅截取 CH1 纯净中段（20%~60% 宽度），避开右端圆孔与左端阴影
+            strip_x1 = int(x1 + box_w * 0.20)
+            strip_x2 = int(x1 + box_w * 0.60)
+            strip_x1, strip_x2 = max(0, strip_x1), min(img_w, strip_x2)
 
-        # 逐行寻找峰值（锁定每一行的顶部 y 坐标）
-        row_y = [y1]
-        step_min = int(box_h * 1.05)  # 最小行跨度（管高 + 间隙）
-        curr_y = y1
+            if strip_x2 > strip_x1:
+                # 沿 X 轴求均值，压成一条从上至下的亮度纵向曲线 I(y)
+                vert_profile = np.mean(gray[:, strip_x1:strip_x2], axis=1)
+                # 使用大核高斯滤波消除果蝇活动黑点与反光高频噪波
+                smooth_prof = cv2.GaussianBlur(vert_profile.reshape(-1, 1), (1, 21), 0).ravel()
 
-        for _ in range(1, rows):
-            search_start = curr_y + step_min
-            search_end = min(len(y_corr), search_start + int(box_h * 0.5))
-            if search_end > search_start:
-                peak_offset = int(np.argmax(y_corr[search_start:search_end]))
-                best_y = search_start + peak_offset
-                row_y.append(best_y)
-                curr_y = best_y
+                ch1_center_y = (y1 + y2) // 2
+                detected_centers = [ch1_center_y]
+                curr_c = ch1_center_y
+                est_pitch = fallback_pitch_y
+
+                # 逐行向下在预期窗口内寻找下一个高亮管身中心
+                for r in range(1, rows):
+                    expected_c = curr_c + est_pitch
+                    # 搜索窗口限制在预期位置的上下 20% 管高内
+                    win_start = max(0, expected_c - int(box_h * 0.20))
+                    win_end = min(img_h, expected_c + int(box_h * 0.20))
+
+                    if win_end > win_start:
+                        peak_offset = int(np.argmax(smooth_prof[win_start:win_end]))
+                        best_c = win_start + peak_offset
+                        detected_centers.append(best_c)
+                        # 动态微调后续预测步长
+                        if best_c > curr_c:
+                            est_pitch = best_c - curr_c
+                        curr_c = best_c
+                    else:
+                        detected_centers.append(expected_c)
+                        curr_c = expected_c
+
+                # 利用模具刚性先验：使用中位数步长统一所有行，杜绝第 2 行等单行漂移
+                pitches = [detected_centers[i] - detected_centers[i - 1] for i in range(1, len(detected_centers))]
+                valid_pitches = [p for p in pitches if int(box_h * 0.95) <= p <= int(box_h * 1.4)]
+                median_pitch = int(np.median(valid_pitches)) if valid_pitches else fallback_pitch_y
+
+                # 重新以刚性公式精确生成各行 Y 起始点
+                row_y = [int(ch1_center_y - box_h // 2 + r * median_pitch) for r in range(rows)]
             else:
-                # 保底：若超出画面则使用固定步长
-                pitch_y = (row_y[-1] - row_y[0]) / (len(row_y) - 1)
-                row_y.append(int(curr_y + pitch_y))
+                row_y = [int(y1 + r * fallback_pitch_y) for r in range(rows)]
+
+            # -------------------------------------------------------
+            # 2. 水平方向（X轴）：利用中央黑色竖隔梁定位右列
+            # -------------------------------------------------------
+            # 探测中央黑色立梁（在 CH1 右边界附近往右一段区域内）
+            seam_search_x1 = max(0, x2 - 10)
+            seam_search_x2 = min(img_w, x2 + int(box_w * 0.25))
+
+            sample_y1 = max(0, row_y[0])
+            sample_y2 = min(img_h, row_y[-1] + box_h)
+
+            col2_x1 = x2 + fallback_col2_gap
+            if (seam_search_x2 > seam_search_x1) and (sample_y2 > sample_y1):
+                vert_seam_strip = gray[sample_y1:sample_y2, seam_search_x1:seam_search_x2]
+                col_prof = np.mean(vert_seam_strip, axis=0)
+                smooth_col = cv2.GaussianBlur(col_prof.reshape(1, -1), (1, 11), 0).ravel()
+
+                # 找到中央隔梁最暗处（深谷）
+                valley_rel_x = int(np.argmin(smooth_col))
+
+                # 隔梁右侧通常是由暗转亮的陡峭正跳变（右列试管左内沿）
+                grad_col = np.gradient(smooth_col)
+                search_right = grad_col[valley_rel_x:]
+                if len(search_right) > 0 and np.max(search_right) > 0:
+                    edge_offset = valley_rel_x + int(np.argmax(search_right))
+                    col2_x1 = seam_search_x1 + edge_offset
+
+            cols_x = [x1, col2_x1]
+
+        except Exception:
+            # 发生任何未预料异常，平稳回退到等距几何网格
+            row_y = [int(y1 + r * fallback_pitch_y) for r in range(rows)]
+            cols_x = [x1, x2 + fallback_col2_gap]
 
         # -----------------------------------------------------------
-        # 2. 水平方向（X轴）：利用中央暗槽的精确几何边界定位右列
+        # 3. 刚性装配网格并做图像边界裁剪
         # -----------------------------------------------------------
-        # 在 CH1 右侧到画面 65% 区域内探测中央暗槽的“谷底”和“宽度”
-        seam_search_x1 = x2 - 10
-        seam_search_x2 = min(img_w, x2 + int(box_w * 0.4))
-        
-        # 截取中部横带计算垂直投影（使用所有已探测试管的高度范围，提升抗噪能力）
-        sample_y1, sample_y2 = row_y[0], row_y[-1] + box_h
-        vertical_strip = gray[sample_y1:sample_y2, seam_search_x1:seam_search_x2]
-        col_prof = np.mean(vertical_strip, axis=0)  # 暗槽表现为一个深谷
-
-        # 寻找暗槽两侧壁边缘：对投影求导找“最暗谷底”及其右侧的“上升跳变沿”
-        smooth_prof = cv2.GaussianBlur(col_prof.reshape(1, -1), (1, 9), 0).ravel()
-        valley_rel_x = int(np.argmin(smooth_prof))
-        
-        # 寻找暗槽右边界（谷底右侧梯度最大的上升沿，即右列试管左边缘）
-        grad_prof = np.gradient(smooth_prof)
-        search_right_edge = grad_prof[valley_rel_x:]
-        if len(search_right_edge) > 0 and np.max(search_right_edge) > 0:
-            right_edge_rel = valley_rel_x + int(np.argmax(search_right_edge))
-            col2_x1 = seam_search_x1 + right_edge_rel
-        else:
-            # 保底回退：若未测到上升沿，使用暗槽中心对称
-            seam_center = seam_search_x1 + valley_rel_x
-            gap = max(6, (seam_center - x2) * 2)
-            col2_x1 = x2 + gap
-
-        # -----------------------------------------------------------
-        # 3. 刚性装配网格（严格锁定尺寸，消灭边缘漂移）
-        # -----------------------------------------------------------
-        # 左右两列的 X 起始点
-        cols_x = [x1, col2_x1]
-
         grid = []
         for r in range(rows):
             r_boxes = []
             for c in range(cols):
-                bx1 = cols_x[c]
+                bx1 = cols_x[c] if c < len(cols_x) else (x1 + c * (box_w + fallback_col2_gap))
                 by1 = row_y[r]
                 bx2 = bx1 + box_w
                 by2 = by1 + box_h
-                r_boxes.append((int(bx1), int(by1), int(bx2), int(by2)))
+
+                # 边界保护
+                cbx1 = int(np.clip(bx1, 0, img_w - 10))
+                cby1 = int(np.clip(by1, 0, img_h - 10))
+                cbx2 = int(np.clip(bx2, cbx1 + 10, img_w))
+                cby2 = int(np.clip(by2, cby1 + 10, img_h))
+
+                r_boxes.append((cbx1, cby1, cbx2, cby2))
             grid.append(r_boxes)
 
         # -----------------------------------------------------------
-        # 4. 按指定排布顺序输出
+        # 4. 按序输出，保证 100% 返回 List[Tuple]
         # -----------------------------------------------------------
-        chambers = []
+        chambers: List[Tuple[int, int, int, int]] = []
         if order == "column_first":
             for c in range(cols):
                 for r in range(rows):

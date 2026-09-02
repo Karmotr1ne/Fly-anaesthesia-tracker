@@ -98,41 +98,71 @@ class InteractiveChamberCanvas(QWidget):
     chamberSelected = pyqtSignal(int)
     firstRoiDrawn = pyqtSignal(tuple)
     boxChanged = pyqtSignal()
+    selectionChanged = pyqtSignal(int)  # 传递当前选中的数量
+
+    MIN_WIDTH = 25
+    MIN_HEIGHT = 15
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.sample_frame = None
         self.boxes: List[List[int]] = []
-        
-        # 选中状态：支持多选集合与主活动选中项
-        self.selected_idx = 0
-        self.selected_indices = set([0])
-        
-        self.link_mode = "all"  # "single", "col", "row", "all"
+
+        # 撤销历史栈
+        self.undo_stack: List[Tuple[List[List[int]], set, int]] = []
+        self.max_undo = 30
+
+        # 选中状态管理：默认单选
+        self.selected_idx = -1
+        self.selected_indices = set()
+
+        # 默认模式改为 "single"
+        self.link_mode = "single"  # "single", "col", "row", "all" (表示所有选中)
         self.rows = 4
         self.cols = 2
         self.show_mask = False
         self.diff_thresh = 14
         self.fly_centroids: Dict[int, Optional[Tuple[float, float]]] = {}
 
-        # 首次绘制模式（初始无ROI时）
+        # 绘制与框选状态
         self.is_drawing_first = False
         self.draw_start_point = None
         self.current_drawing_rect = None
 
-        # 鼠标不在ROI上时的“框选模式”状态
         self.is_box_selecting = False
         self.select_start_img = None
         self.current_select_rect_img = None
+        self.press_pos = None
 
         # 拖拽与缩放状态
-        self.drag_mode = None  # "move", "resize_l", "resize_r", "resize_t", "resize_b", ...
+        self.drag_mode = None
         self.drag_start_pos = None
         self.drag_initial_boxes = []
 
         self.setStyleSheet("background-color: #0F172A; border-radius: 8px;")
         self.setMinimumSize(720, 480)
+
+    def _push_undo(self):
+        """保存当前 boxes 副本与选择状态到撤销栈"""
+        state = ([list(b) for b in self.boxes], set(self.selected_indices), self.selected_idx)
+        self.undo_stack.append(state)
+        if len(self.undo_stack) > self.max_undo:
+            self.undo_stack.pop(0)
+
+    def undo(self):
+        """撤销到上一步"""
+        if not self.undo_stack:
+            return
+        boxes_prev, indices_prev, idx_prev = self.undo_stack.pop()
+        self.boxes = [list(b) for b in boxes_prev]
+        self.selected_indices = set(indices_prev)
+        self.selected_idx = idx_prev
+        self._update_fly_detections()
+        self.selectionChanged.emit(len(self.selected_indices))
+        self.boxChanged.emit()
+        self.update()
 
     def set_data(self, frame: np.ndarray, boxes: List[List[int]], rows: int = 4, cols: int = 2):
         self.sample_frame = frame
@@ -140,21 +170,30 @@ class InteractiveChamberCanvas(QWidget):
         self.rows = rows
         self.cols = cols
         self.is_drawing_first = (len(self.boxes) == 0)
-        self.selected_idx = 0 if self.boxes else -1
-        self.selected_indices = set([0]) if self.boxes else set()
+        self.undo_stack.clear()
+        
+        # 默认选中第 1 个 chamber
+        if self.boxes:
+            self.selected_idx = 0
+            self.selected_indices = {0}
+        else:
+            self.selected_idx = -1
+            self.selected_indices = set()
+
         self._update_fly_detections()
+        self.selectionChanged.emit(len(self.selected_indices))
         self.update()
 
     def start_redraw_first_roi(self):
-        """Initiates manual first ROI drawing mode."""
+        self._push_undo()
         self.is_drawing_first = True
         self.boxes = []
         self.selected_idx = -1
         self.selected_indices.clear()
+        self.selectionChanged.emit(0)
         self.update()
 
     def _update_fly_detections(self):
-        """Executes single-frame centroid detection for live visual feedback."""
         if self.sample_frame is None or not self.boxes:
             return
         gray = cv2.cvtColor(self.sample_frame, cv2.COLOR_BGR2GRAY)
@@ -194,34 +233,39 @@ class InteractiveChamberCanvas(QWidget):
         return (cx - ox) / s, (cy - oy) / s
 
     def _hit_test(self, cx, cy):
-        """测试点击是否命中当前选中的手柄或某个 ROI。若没有命中任何区域则返回 None, -1"""
         if self.is_drawing_first or not self.boxes:
             return None, -1
 
-        s, ox, oy = self.get_scale_and_offsets()
-        handle_size = 8
+        # 适当扩大手柄触控范围至 10px，避免鼠标难以精准对准
+        handle_hit_margin = 10.0
 
-        # 1. 优先检查当前活动 ROI 的 8 个缩放手柄
+        # 1. 优先判定当前主选中 Chamber 的 8 个调节手柄
         if 0 <= self.selected_idx < len(self.boxes):
             bx1, by1, bx2, by2 = self.boxes[self.selected_idx]
             rx1, ry1 = self.img_to_canvas(bx1, by1)
             rx2, ry2 = self.img_to_canvas(bx2, by2)
 
-            near_l = abs(cx - rx1) <= handle_size and (ry1 - handle_size <= cy <= ry2 + handle_size)
-            near_r = abs(cx - rx2) <= handle_size and (ry1 - handle_size <= cy <= ry2 + handle_size)
-            near_t = abs(cy - ry1) <= handle_size and (rx1 - handle_size <= cx <= rx2 + handle_size)
-            near_b = abs(cy - ry2) <= handle_size and (rx1 - handle_size <= cx <= rx2 + handle_size)
+            near_l = abs(cx - rx1) <= handle_hit_margin
+            near_r = abs(cx - rx2) <= handle_hit_margin
+            near_t = abs(cy - ry1) <= handle_hit_margin
+            near_b = abs(cy - ry2) <= handle_hit_margin
 
+            in_y_range = (ry1 - handle_hit_margin <= cy <= ry2 + handle_hit_margin)
+            in_x_range = (rx1 - handle_hit_margin <= cx <= rx2 + handle_hit_margin)
+
+            # 四角手柄
             if near_l and near_t: return "resize_tl", self.selected_idx
             if near_r and near_t: return "resize_tr", self.selected_idx
             if near_l and near_b: return "resize_bl", self.selected_idx
             if near_r and near_b: return "resize_br", self.selected_idx
-            if near_l: return "resize_l", self.selected_idx
-            if near_r: return "resize_r", self.selected_idx
-            if near_t: return "resize_t", self.selected_idx
-            if near_b: return "resize_b", self.selected_idx
+            
+            # 四边手柄
+            if near_l and in_y_range: return "resize_l", self.selected_idx
+            if near_r and in_y_range: return "resize_r", self.selected_idx
+            if near_t and in_x_range: return "resize_t", self.selected_idx
+            if near_b and in_x_range: return "resize_b", self.selected_idx
 
-        # 2. 检查是否点击在任何一个 ROI 框内部
+        # 2. 检查是否点击在任何 Chamber 内部（用于移动）
         for idx, (x1, y1, x2, y2) in enumerate(self.boxes):
             kx1, ky1 = self.img_to_canvas(x1, y1)
             kx2, ky2 = self.img_to_canvas(x2, y2)
@@ -230,11 +274,129 @@ class InteractiveChamberCanvas(QWidget):
 
         return None, -1
 
+    def mouseMoveEvent(self, event):
+        cx, cy = event.position().x(), event.position().y()
+
+        # 1. 首次绘制模式
+        if self.is_drawing_first and self.draw_start_point:
+            ix, iy = self.canvas_to_img(cx, cy)
+            sx, sy = self.draw_start_point
+            self.current_drawing_rect = (min(sx, ix), min(sy, iy), max(sx, ix), max(sy, iy))
+            self.update()
+            return
+
+        # 2. 空白处框选移动
+        if self.is_box_selecting and self.select_start_img:
+            ix, iy = self.canvas_to_img(cx, cy)
+            sx, sy = self.select_start_img
+            self.current_select_rect_img = (min(sx, ix), min(sy, iy), max(sx, ix), max(sy, iy))
+            self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
+            self.update()
+            return
+
+        # 3. 拖拽移动与边缘拉伸
+        if self.drag_mode and self.drag_start_pos:
+            s, _, _ = self.get_scale_and_offsets()
+            dx = (cx - self.drag_start_pos[0]) / s
+            dy = (cy - self.drag_start_pos[1]) / s
+            img_h, img_w = self.sample_frame.shape[:2] if self.sample_frame is not None else (1000, 1000)
+
+            if not self.selected_indices:
+                self.selected_indices = {self.selected_idx} if self.selected_idx >= 0 else {0}
+                if self.selected_idx < 0:
+                    self.selected_idx = 0
+                self.selectionChanged.emit(len(self.selected_indices))
+
+            sel_row = self.selected_idx % self.rows
+            sel_col = self.selected_idx // self.rows
+
+            # 先克隆一份临时候选数据预演移动/拉伸
+            tentative_boxes = [list(b) for b in self.boxes]
+
+            for idx in range(len(self.boxes)):
+                apply = False
+                cur_row = idx % self.rows
+                cur_col = idx // self.rows
+
+                if len(self.selected_indices) > 1:
+                    apply = (idx in self.selected_indices)
+                else:
+                    if self.link_mode == "all":
+                        apply = (idx in self.selected_indices)
+                    elif self.link_mode == "col" and cur_col == sel_col:
+                        apply = True
+                    elif self.link_mode == "row" and cur_row == sel_row:
+                        apply = True
+                    elif self.link_mode == "single":
+                        apply = (idx in self.selected_indices or idx == self.selected_idx)
+
+                if apply:
+                    ox1, oy1, ox2, oy2 = self.drag_initial_boxes[idx]
+                    nx1, ny1, nx2, ny2 = ox1, oy1, ox2, oy2
+
+                    if self.drag_mode == "move":
+                        nx1, ny1 = ox1 + dx, oy1 + dy
+                        nx2, ny2 = ox2 + dx, oy2 + dy
+                    else:
+                        # 边角手柄拉伸计算
+                        if "resize_l" in self.drag_mode or self.drag_mode in ("resize_tl", "resize_bl"):
+                            nx1 = min(ox2 - self.MIN_WIDTH, ox1 + dx)
+                        if "resize_r" in self.drag_mode or self.drag_mode in ("resize_tr", "resize_br"):
+                            nx2 = max(ox1 + self.MIN_WIDTH, ox2 + dx)
+                        if "resize_t" in self.drag_mode or self.drag_mode in ("resize_tl", "resize_tr"):
+                            ny1 = min(oy2 - self.MIN_HEIGHT, oy1 + dy)
+                        if "resize_b" in self.drag_mode or self.drag_mode in ("resize_bl", "resize_br"):
+                            ny2 = max(oy1 + self.MIN_HEIGHT, oy2 + dy)
+
+                    tentative_boxes[idx][0] = int(np.clip(nx1, 0, img_w - self.MIN_WIDTH))
+                    tentative_boxes[idx][1] = int(np.clip(ny1, 0, img_h - self.MIN_HEIGHT))
+                    tentative_boxes[idx][2] = int(np.clip(nx2, self.MIN_WIDTH, img_w))
+                    tentative_boxes[idx][3] = int(np.clip(ny2, self.MIN_HEIGHT, img_h))
+
+            # 优化碰撞检查：允许贴合，仅当被修改的 box 发生实质性侵入穿透时才阻断
+            can_apply = True
+            for idx in range(len(self.boxes)):
+                # 如果这个 box 根本没参与本次拖动变形，跳过检测
+                if tentative_boxes[idx] == self.drag_initial_boxes[idx]:
+                    continue
+                # 与其他 box 进行碰撞检测
+                for other_idx in range(len(self.boxes)):
+                    if idx == other_idx:
+                        continue
+                    # 容许 2px 的边界重叠误差，防止相邻边缘直接把拉伸卡死
+                    if self._is_intersecting(tentative_boxes[idx], tentative_boxes[other_idx], margin=2):
+                        can_apply = False
+                        break
+                if not can_apply:
+                    break
+
+            if can_apply:
+                self.boxes = tentative_boxes
+                self.boxChanged.emit()
+                self.update()
+        else:
+            action, _ = self._hit_test(cx, cy)
+            cursor_map = {
+                "resize_l": Qt.CursorShape.SizeHorCursor,
+                "resize_r": Qt.CursorShape.SizeHorCursor,
+                "resize_t": Qt.CursorShape.SizeVerCursor,
+                "resize_b": Qt.CursorShape.SizeVerCursor,
+                "resize_tl": Qt.CursorShape.SizeFDiagCursor,
+                "resize_br": Qt.CursorShape.SizeFDiagCursor,
+                "resize_tr": Qt.CursorShape.SizeBDiagCursor,
+                "resize_bl": Qt.CursorShape.SizeBDiagCursor,
+                "move": Qt.CursorShape.SizeAllCursor,
+            }
+            self.setCursor(QCursor(cursor_map.get(action, Qt.CursorShape.ArrowCursor)))
+
     def mousePressEvent(self, event):
+        self.setFocus()
         if event.button() == Qt.MouseButton.LeftButton:
             cx, cy = event.position().x(), event.position().y()
+            self.press_pos = (cx, cy)
+            modifiers = event.modifiers()
+            has_modifier = bool(modifiers & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier))
 
-            # 首次手动绘制第 1 个管子
             if self.is_drawing_first:
                 ix, iy = self.canvas_to_img(cx, cy)
                 self.draw_start_point = (ix, iy)
@@ -245,7 +407,7 @@ class InteractiveChamberCanvas(QWidget):
             action, idx = self._hit_test(cx, cy)
 
             if action is None:
-                # 核心逻辑：鼠标不在任何 ROI 上，开启划区框选（Rubberband Selection）
+                # 点击在 Chamber 外部：准备橡皮筋框选
                 ix, iy = self.canvas_to_img(cx, cy)
                 self.is_box_selecting = True
                 self.select_start_img = (ix, iy)
@@ -253,150 +415,85 @@ class InteractiveChamberCanvas(QWidget):
                 self.update()
                 return
 
-            # 点击了某个具体的 ROI
+            # 点击了手柄或内部
             if action == "move":
-                # 如果点击的不是已经选中的多选组，则重置为单选该项
-                if idx not in self.selected_indices:
-                    self.selected_indices = {idx}
-                self.selected_idx = idx
-                self.chamberSelected.emit(idx + 1)
+                if has_modifier:
+                    # Shift/Ctrl 加选 / 减选
+                    if idx in self.selected_indices:
+                        self.selected_indices.remove(idx)
+                        self.selected_idx = next(iter(self.selected_indices)) if self.selected_indices else -1
+                    else:
+                        self.selected_indices.add(idx)
+                        self.selected_idx = idx
+                else:
+                    # 若点击的项未在当前多选组内，则重置为仅单选该项
+                    if idx not in self.selected_indices:
+                        self.selected_indices = {idx}
+                        self.selected_idx = idx
+                    else:
+                        self.selected_idx = idx
             else:
                 self.selected_idx = idx
+                self.selected_indices.add(idx)
+
+            if self.selected_idx >= 0:
+                self.chamberSelected.emit(self.selected_idx + 1)
+            self.selectionChanged.emit(len(self.selected_indices))
 
             self.drag_mode = action
             self.drag_start_pos = (cx, cy)
             self.drag_initial_boxes = [list(b) for b in self.boxes]
             self.update()
 
-    def mouseMoveEvent(self, event):
-        cx, cy = event.position().x(), event.position().y()
-
-        # 1. 首次绘制模式移动
-        if self.is_drawing_first and self.draw_start_point:
-            ix, iy = self.canvas_to_img(cx, cy)
-            sx, sy = self.draw_start_point
-            x1, x2 = min(sx, ix), max(sx, ix)
-            y1, y2 = min(sy, iy), max(sy, iy)
-            self.current_drawing_rect = (x1, y1, x2, y2)
-            self.update()
-            return
-
-        # 2. 空白处划区多选移动
-        if self.is_box_selecting and self.select_start_img:
-            ix, iy = self.canvas_to_img(cx, cy)
-            sx, sy = self.select_start_img
-            x1, x2 = min(sx, ix), max(sx, ix)
-            y1, y2 = min(sy, iy), max(sy, iy)
-            self.current_select_rect_img = (x1, y1, x2, y2)
-            self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
-            self.update()
-            return
-
-        # 3. 拖拽移动与边缘拉伸
-        if self.drag_mode and self.drag_start_pos:
-            s, _, _ = self.get_scale_and_offsets()
-            dx = (cx - self.drag_start_pos[0]) / s
-            dy = (cy - self.drag_start_pos[1]) / s
-            img_h, img_w = (self.sample_frame.shape[:2]) if self.sample_frame is not None else (1000, 1000)
-            sel_row = self.selected_idx % self.rows
-            sel_col = self.selected_idx // self.rows
-
-            for idx in range(len(self.boxes)):
-                apply = False
-                cur_row = idx % self.rows
-                cur_col = idx // self.rows
-
-                if self.link_mode == "all":
-                    apply = True
-                elif self.link_mode == "col" and cur_col == sel_col:
-                    apply = True
-                elif self.link_mode == "row" and cur_row == sel_row:
-                    apply = True
-                elif self.link_mode == "single":
-                    # 在单选/默认联动模式下，允许已划区选中的所有 ROI 一同平移
-                    if idx in self.selected_indices:
-                        apply = True
-
-                if apply:
-                    ox1, oy1, ox2, oy2 = self.drag_initial_boxes[idx]
-                    nx1, ny1, nx2, ny2 = ox1, oy1, ox2, oy2
-                    if self.drag_mode == "move":
-                        nx1, ny1 = ox1 + dx, oy1 + dy
-                        nx2, ny2 = ox2 + dx, oy2 + dy
-                    elif "resize_l" in self.drag_mode:
-                        nx1 = min(ox2 - 20, ox1 + dx)
-                    elif "resize_r" in self.drag_mode:
-                        nx2 = max(ox1 + 20, ox2 + dx)
-                    if "resize_t" in self.drag_mode:
-                        ny1 = min(oy2 - 15, oy1 + dy)
-                    elif "resize_b" in self.drag_mode:
-                        ny2 = max(oy1 + 15, oy2 + dy)
-
-                    self.boxes[idx][0] = int(np.clip(nx1, 0, img_w - 10))
-                    self.boxes[idx][1] = int(np.clip(ny1, 0, img_h - 10))
-                    self.boxes[idx][2] = int(np.clip(nx2, 10, img_w))
-                    self.boxes[idx][3] = int(np.clip(ny2, 10, img_h))
-
-            self.boxChanged.emit()
-            self.update()
-        else:
-            # 鼠标悬浮光标状态切换
-            if self.is_drawing_first:
-                self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
-            else:
-                action, _ = self._hit_test(cx, cy)
-                if action in ["resize_l", "resize_r"]:
-                    self.setCursor(QCursor(Qt.CursorShape.SizeHorCursor))
-                elif action in ["resize_t", "resize_b"]:
-                    self.setCursor(QCursor(Qt.CursorShape.SizeVerCursor))
-                elif action in ["resize_tl", "resize_br"]:
-                    self.setCursor(QCursor(Qt.CursorShape.SizeFDiagCursor))
-                elif action in ["resize_tr", "resize_bl"]:
-                    self.setCursor(QCursor(Qt.CursorShape.SizeBDiagCursor))
-                elif action == "move":
-                    self.setCursor(QCursor(Qt.CursorShape.SizeAllCursor))
-                else:
-                    self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
-
     def mouseReleaseEvent(self, event):
-        # 1. 完成首次第 1 个 ROI 绘制
+        # 1. 首次手工拉框
         if self.is_drawing_first and self.current_drawing_rect:
             x1, y1, x2, y2 = self.current_drawing_rect
-            if (x2 - x1) > 40 and (y2 - y1) > 15:
+            if (x2 - x1) >= self.MIN_WIDTH and (y2 - y1) >= self.MIN_HEIGHT:
                 self.is_drawing_first = False
                 self.draw_start_point = None
                 self.current_drawing_rect = None
-                first_box = (int(x1), int(y1), int(x2), int(y2))
-                self.firstRoiDrawn.emit(first_box)
+                self._push_undo()
+                self.firstRoiDrawn.emit((int(x1), int(y1), int(x2), int(y2)))
             else:
                 self.draw_start_point = None
                 self.current_drawing_rect = None
                 self.update()
             return
 
-        # 2. 完成划区多选逻辑
-        if self.is_box_selecting and self.current_select_rect_img:
-            rx1, ry1, rx2, ry2 = self.current_select_rect_img
-            sel_w = rx2 - rx1
-            sel_h = ry2 - ry1
+        # 2. 外部框选或单击 Chamber 外取消选择
+        if self.is_box_selecting:
+            cx, cy = event.position().x(), event.position().y()
+            is_click = self.press_pos and (abs(cx - self.press_pos[0]) < 4 and abs(cy - self.press_pos[1]) < 4)
 
-            if sel_w > 10 and sel_h > 10:
-                # 计算与选框发生相交/包含关系的 ROI
-                new_selection = set()
-                for idx, (bx1, by1, bx2, by2) in enumerate(self.boxes):
-                    # 矩形 AABB 相交测试
-                    intersect = not (bx2 < rx1 or bx1 > rx2 or by2 < ry1 or by1 > ry2)
-                    if intersect:
-                        new_selection.add(idx)
+            if is_click:
+                # 选定 chamber 时，单击 chamber 外直接取消选择
+                modifiers = event.modifiers()
+                has_modifier = bool(modifiers & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier))
+                if not has_modifier:
+                    self.selected_indices.clear()
+                    self.selected_idx = -1
+                    self.selectionChanged.emit(0)
+            elif self.current_select_rect_img:
+                rx1, ry1, rx2, ry2 = self.current_select_rect_img
+                if (rx2 - rx1) > 5 and (ry2 - ry1) > 5:
+                    hit_set = set()
+                    for idx, (bx1, by1, bx2, by2) in enumerate(self.boxes):
+                        if not (bx2 < rx1 or bx1 > rx2 or by2 < ry1 or by1 > ry2):
+                            hit_set.add(idx)
 
-                if new_selection:
-                    self.selected_indices = new_selection
-                    # 将编号最小的作为当前主活动项
-                    self.selected_idx = min(new_selection)
-                    self.chamberSelected.emit(self.selected_idx + 1)
-            else:
-                # 只是很短的空白处点击，不重置选择或保持原样
-                pass
+                    modifiers = event.modifiers()
+                    if modifiers & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier):
+                        self.selected_indices.update(hit_set)
+                    else:
+                        self.selected_indices = hit_set
+
+                    if self.selected_indices:
+                        self.selected_idx = min(self.selected_indices)
+                        self.chamberSelected.emit(self.selected_idx + 1)
+                    else:
+                        self.selected_idx = -1
+                    self.selectionChanged.emit(len(self.selected_indices))
 
             self.is_box_selecting = False
             self.select_start_img = None
@@ -404,11 +501,63 @@ class InteractiveChamberCanvas(QWidget):
             self.update()
             return
 
-        # 3. 完成平移/缩放拖拽
-        self.drag_mode = None
-        self.drag_start_pos = None
-        self._update_fly_detections()
-        self.update()
+        # 3. 拖拽变形结束：推入撤销栈
+        if self.drag_mode:
+            if self.drag_initial_boxes != self.boxes:
+                # 将初始状态作为撤销点推入栈
+                state = ([list(b) for b in self.drag_initial_boxes], set(self.selected_indices), self.selected_idx)
+                self.undo_stack.append(state)
+                if len(self.undo_stack) > self.max_undo:
+                    self.undo_stack.pop(0)
+
+            self.drag_mode = None
+            self.drag_start_pos = None
+            self._update_fly_detections()
+            self.update()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Z and (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            self.undo()
+            return
+
+        if not self.boxes:
+            super().keyPressEvent(event)
+            return
+
+        if not self.selected_indices:
+            self.selected_indices = set(range(len(self.boxes)))
+            self.selected_idx = 0
+            self.selectionChanged.emit(len(self.selected_indices))
+
+        step = 5 if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier) else 1
+        dx, dy = 0, 0
+
+        key = event.key()
+        if key == Qt.Key.Key_Left: dx = -step
+        elif key == Qt.Key.Key_Right: dx = step
+        elif key == Qt.Key.Key_Up: dy = -step
+        elif key == Qt.Key.Key_Down: dy = step
+        else:
+            super().keyPressEvent(event)
+            return
+
+        img_h, img_w = self.sample_frame.shape[:2] if self.sample_frame is not None else (1000, 1000)
+        tentative_boxes = [list(b) for b in self.boxes]
+
+        for idx in list(self.selected_indices):
+            x1, y1, x2, y2 = tentative_boxes[idx]
+            w, h = x2 - x1, y2 - y1
+            nx1 = np.clip(x1 + dx, 0, img_w - w)
+            ny1 = np.clip(y1 + dy, 0, img_h - h)
+            tentative_boxes[idx] = [int(nx1), int(ny1), int(nx1 + w), int(ny1 + h)]
+
+        # 碰撞校验：无重合才真正保存并生效
+        if not self._has_any_overlap(tentative_boxes):
+            self._push_undo()
+            self.boxes = tentative_boxes
+            self.boxChanged.emit()
+            self._update_fly_detections()
+            self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -422,32 +571,20 @@ class InteractiveChamberCanvas(QWidget):
         s, ox, oy = self.get_scale_and_offsets()
         img_h, img_w = self.sample_frame.shape[:2]
 
-        # 1. Render camera image or darkness energy mask
         if self.show_mask:
             gray = cv2.cvtColor(self.sample_frame, cv2.COLOR_BGR2GRAY)
-            
-            # (1) 图像反转：使原本的暗区（如果蝇）变成亮区
             inv = cv2.bitwise_not(gray)
-            
-            # (2) 多尺度形态学黑帽操作：捕捉不同体型大小的深色目标
             kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
             kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
             bh_s = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel_small)
             bh_l = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel_large)
-            # 融合黑帽能量与局部反色
             energy = cv2.addWeighted(bh_s, 0.6, bh_l, 0.4, 0)
             energy = cv2.addWeighted(energy, 0.7, inv, 0.3, 0)
-
-            # (3) 核心改进：CLAHE 自适应直方图均衡化 + Min-Max 全动态范围拉伸至 0~255
             clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8))
             enhanced = clahe.apply(energy)
             norm_energy = cv2.normalize(enhanced, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
-
-            # (4) 伽马校正 / 阈值强化：压制灰色背景噪声，让暗区目标超高亮爆发
             _, thresh_mask = cv2.threshold(norm_energy, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             boosted = cv2.addWeighted(norm_energy, 0.7, thresh_mask, 0.3, 0)
-            
-            # (5) 选用对比度更强烈的伪彩色图谱
             vis = cv2.applyColorMap(boosted, cv2.COLORMAP_JET)
         else:
             vis = self.sample_frame.copy()
@@ -458,13 +595,12 @@ class InteractiveChamberCanvas(QWidget):
         qimg = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
         painter.drawImage(QRectF(ox, oy, w * s, h * s), qimg)
 
-        # 2. 中缝参考线
+        # 中轴参考线
         mid_x = ox + (img_w * 0.5) * s
-        pen_divider = QPen(QColor("#94A3B8"), 1, Qt.PenStyle.DashLine)
-        painter.setPen(pen_divider)
+        painter.setPen(QPen(QColor("#94A3B8"), 1, Qt.PenStyle.DashLine))
         painter.drawLine(int(mid_x), int(oy), int(mid_x), int(oy + img_h * s))
 
-        # 3. 初始 ROI 绘制指示
+        # 首次绘制引导
         if self.is_drawing_first and self.current_drawing_rect:
             x1, y1, x2, y2 = self.current_drawing_rect
             rx1, ry1 = self.img_to_canvas(x1, y1)
@@ -480,7 +616,7 @@ class InteractiveChamberCanvas(QWidget):
         font_label = QFont("Arial", 9, QFont.Weight.Bold)
         font_dim = QFont("Arial", 8)
 
-        # 4. 绘制所有已校准的 Chamber ROI
+        # 绘制所有 Chamber
         for idx, (x1, y1, x2, y2) in enumerate(self.boxes):
             cid = idx + 1
             is_active = (idx == self.selected_idx)
@@ -490,17 +626,16 @@ class InteractiveChamberCanvas(QWidget):
             rx2, ry2 = self.img_to_canvas(x2, y2)
             rw, rh = rx2 - rx1, ry2 - ry1
 
-            # 如果在多选集合内或当前激活项，显示高亮边框和半透明填充
             if is_active:
-                border_color = QColor("#F59E0B")  # 活跃项：橙色
+                border_color = QColor("#F59E0B")
                 fill_color = QColor(245, 158, 11, 35)
                 line_w = 2.5
             elif is_in_group:
-                border_color = QColor("#38BDF8")  # 多选项：天蓝色
+                border_color = QColor("#38BDF8")
                 fill_color = QColor(56, 189, 248, 25)
                 line_w = 2.0
             else:
-                border_color = QColor("#10B981")  # 未选中项：翡翠绿
+                border_color = QColor("#10B981")
                 fill_color = QColor(16, 185, 129, 15)
                 line_w = 1.2
 
@@ -508,13 +643,13 @@ class InteractiveChamberCanvas(QWidget):
             painter.setBrush(QBrush(fill_color))
             painter.drawRoundedRect(QRectF(rx1, ry1, rw, rh), 4, 4)
 
-            # 内部左右边界标记线
+            # 内边缘标线
             painter.setPen(QPen(QColor("#F97316"), 1, Qt.PenStyle.DotLine))
             painter.drawLine(int(rx1 + rw * 0.08), int(ry1), int(rx1 + rw * 0.08), int(ry2))
             painter.setPen(QPen(QColor("#38BDF8"), 1, Qt.PenStyle.DotLine))
             painter.drawLine(int(rx2 - rw * 0.08), int(ry1), int(rx2 - rw * 0.08), int(ry2))
 
-            # Chamber ID Badge 标牌
+            # ID Badge
             tag_rect = QRectF(rx1 + 4, ry1 + 4, 48, 18)
             painter.setPen(Qt.PenStyle.NoPen)
             badge_bg = QColor("#D97706") if is_active else (QColor("#0284C7") if is_in_group else QColor("#0F172A"))
@@ -530,7 +665,7 @@ class InteractiveChamberCanvas(QWidget):
                 painter.setPen(QColor("#FDE68A"))
                 painter.drawText(int(rx1 + 56), int(ry1 + 17), f"{int(x2 - x1)}x{int(y2 - y1)} px")
 
-            # 动物位置十字指示
+            # 十字质心
             if cid in self.fly_centroids and self.fly_centroids[cid] is not None:
                 fx, fy = self.fly_centroids[cid]
                 cfx, cfy = self.img_to_canvas(fx, fy)
@@ -541,20 +676,20 @@ class InteractiveChamberCanvas(QWidget):
                 painter.setBrush(QBrush(QColor("#EF4444")))
                 painter.drawEllipse(QPointF(cfx, cfy), 3.5, 3.5)
 
-            # 仅在当前主活动项上绘制 8 向拉伸控制把手
+            # 仅在当前主活跃项上绘制拉伸手柄
             if is_active:
-                h_size = 6
+                h_size = 7
                 painter.setBrush(QBrush(QColor("#FFFFFF")))
                 painter.setPen(QPen(QColor("#F59E0B"), 1.5))
                 handle_points = [
-                    (rx1, ry1), ((rx1 + rx2)/2, ry1), (rx2, ry1),
-                    (rx1, (ry1 + ry2)/2), (rx2, (ry1 + ry2)/2),
-                    (rx1, ry2), ((rx1 + rx2)/2, ry2), (rx2, ry2)
+                    (rx1, ry1), ((rx1 + rx2) / 2, ry1), (rx2, ry1),
+                    (rx1, (ry1 + ry2) / 2), (rx2, (ry1 + ry2) / 2),
+                    (rx1, ry2), ((rx1 + rx2) / 2, ry2), (rx2, ry2)
                 ]
                 for px, py in handle_points:
-                    painter.drawRect(QRectF(px - h_size/2, py - h_size/2, h_size, h_size))
+                    painter.drawRect(QRectF(px - h_size / 2, py - h_size / 2, h_size, h_size))
 
-        # 5. 绘制空白处拖拽生成的划区橡皮筋矩形
+        # 框选矩形
         if self.is_box_selecting and self.current_select_rect_img:
             x1, y1, x2, y2 = self.current_select_rect_img
             rx1, ry1 = self.img_to_canvas(x1, y1)
@@ -562,6 +697,26 @@ class InteractiveChamberCanvas(QWidget):
             painter.setPen(QPen(QColor("#38BDF8"), 1.5, Qt.PenStyle.DashLine))
             painter.setBrush(QBrush(QColor(56, 189, 248, 45)))
             painter.drawRect(QRectF(rx1, ry1, rx2 - rx1, ry2 - ry1))
+
+    @staticmethod
+    def _is_intersecting(box_a: List[int], box_b: List[int], margin: int = 1) -> bool:
+        """矩形 AABB 相交判断（支持容差 margin，避免相邻试管贴合时误判碰撞）"""
+        ax1, ay1, ax2, ay2 = box_a
+        bx1, by1, bx2, by2 = box_b
+        # 若存在任意一条轴分离（计入 margin 容差），则不相交
+        if (ax2 - margin) <= (bx1 + margin) or (ax1 + margin) >= (bx2 - margin) or \
+           (ay2 - margin) <= (by1 + margin) or (ay1 + margin) >= (by2 - margin):
+            return False
+        return True
+
+    def _has_any_overlap(self, candidate_boxes: List[List[int]], margin: int = 1) -> bool:
+        """检查整组 boxes 内部是否存在任意两两实质性重合"""
+        n = len(candidate_boxes)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if self._is_intersecting(candidate_boxes[i], candidate_boxes[j], margin=margin):
+                    return True
+        return False
 
 
 class ChamberCalibrationDialog(QDialog):
@@ -619,9 +774,10 @@ class ChamberCalibrationDialog(QDialog):
         self.canvas = InteractiveChamberCanvas()
         self.canvas.firstRoiDrawn.connect(self._on_first_roi_drawn)
         self.canvas.boxChanged.connect(self._on_canvas_box_changed)
+        self.canvas.selectionChanged.connect(self._on_selection_changed)
         left_layout.addWidget(self.canvas, 1)
 
-        self.tip_label = QLabel(f"<b>Draw the first tube (CH 1) in top-left</b>: The system will auto-infer all {self.rows} Rows × {self.cols} Cols.")
+        self.tip_label = QLabel(f"<b>Draw the first tube (CH 1) in top-left</b>: System infers {self.rows}x{self.cols} grid. Press Ctrl+Z to undo.")
         self.tip_label.setStyleSheet("color: #E2E8F0; font-size: 13px; background-color: #1E293B; padding: 8px; border-radius: 6px;")
         left_layout.addWidget(self.tip_label)
 
@@ -629,7 +785,7 @@ class ChamberCalibrationDialog(QDialog):
         right_layout = QVBoxLayout()
         right_layout.setSpacing(10)
 
-        # 1. Grid Geometry Configuration
+        # 1. Grid Geometry
         grp_grid = QGroupBox("1. Grid Geometry")
         v_grid = QVBoxLayout()
         
@@ -666,32 +822,38 @@ class ChamberCalibrationDialog(QDialog):
         grp_grid.setLayout(v_grid)
         right_layout.addWidget(grp_grid)
 
-        # 2. Link Mode
+        # 2. Link Mode (重命名 "All" -> "移动所有选中", 默认 "Single")
         grp_mode = QGroupBox("2. Drag & Resize Link Mode")
         v_mode = QVBoxLayout()
-        self.rb_all = QRadioButton("All Chambers Linked (All)")
+        self.rb_single = QRadioButton("Single Active Chamber (Default)")
+        self.rb_all = QRadioButton("Move All Selected Chambers")
         self.rb_col = QRadioButton("Active Column Linked (Column)")
         self.rb_row = QRadioButton("Active Row Linked (Row)")
-        self.rb_single = QRadioButton("Single Active Chamber (Single)")
-        self.rb_all.setChecked(True)
+        self.rb_single.setChecked(True)
 
+        self.rb_single.toggled.connect(lambda: self._set_mode("single"))
         self.rb_all.toggled.connect(lambda: self._set_mode("all"))
         self.rb_col.toggled.connect(lambda: self._set_mode("col"))
         self.rb_row.toggled.connect(lambda: self._set_mode("row"))
-        self.rb_single.toggled.connect(lambda: self._set_mode("single"))
 
+        v_mode.addWidget(self.rb_single)
         v_mode.addWidget(self.rb_all)
         v_mode.addWidget(self.rb_col)
         v_mode.addWidget(self.rb_row)
-        v_mode.addWidget(self.rb_single)
         grp_mode.setLayout(v_mode)
         right_layout.addWidget(grp_mode)
 
-        # 3. Vision Tools & Auto-Snap
-        grp_tools = QGroupBox("3. Visual Tools & Snap")
+        # 3. Vision Tools, Auto-Snap & Undo
+        grp_tools = QGroupBox("3. Visual Tools & History")
         v_tools = QVBoxLayout()
+        
+        btn_undo = QPushButton("Undo Last Action")
+        btn_undo.setStyleSheet("background-color: #475569; color: white; font-weight: bold; padding: 6px; border-radius: 4px;")
+        btn_undo.clicked.connect(self.canvas.undo)
+        v_tools.addWidget(btn_undo)
+
         btn_snap = QPushButton("Auto-Snap Tube Boundaries")
-        btn_snap.setStyleSheet("background-color: #2563EB; color: white; font-weight: bold; padding: 7px; border-radius: 5px;")
+        btn_snap.setStyleSheet("background-color:  #334155; color: white; padding: 6px; border-radius: 5px;")
         btn_snap.clicked.connect(self._on_auto_snap)
         v_tools.addWidget(btn_snap)
 
@@ -732,6 +894,46 @@ class ChamberCalibrationDialog(QDialog):
 
         main_layout.addLayout(left_layout, 7)
         main_layout.addLayout(right_layout, 3)
+
+    def _on_selection_changed(self, count: int):
+        """当多选时，禁用按行/按列模式"""
+        multi = (count > 1)
+        self.rb_col.setEnabled(not multi)
+        self.rb_row.setEnabled(not multi)
+        if multi and (self.rb_col.isChecked() or self.rb_row.isChecked()):
+            self.rb_all.setChecked(True)
+            self.canvas.link_mode = "all"
+
+    def _on_auto_snap(self):
+        if self.sample_frame is None or not self.canvas.boxes:
+            return
+
+        base_boxes = [list(b) for b in self.canvas.boxes]
+
+        # 1. 调用刚性 1D 吸附策略
+        refined = RobustGridAligner.snap_all_boxes(
+            frame_bgr=self.sample_frame,
+            boxes=base_boxes,
+            rows=self.rows,
+            cols=self.cols
+        )
+
+        # 2. 幂等性检查：若所有单边变化 <= 1px 则认定已完全贴合，不再重复更新
+        has_effective_change = False
+        for old, new in zip(base_boxes, refined):
+            if any(abs(o - n) > 1 for o, n in zip(old, new)):
+                has_effective_change = True
+                break
+
+        if not has_effective_change:
+            return
+
+        # 3. 提交生效
+        self.canvas._push_undo()
+        self.canvas.boxes = refined
+        self.canvas._update_fly_detections()
+        self.canvas.boxChanged.emit()
+        self.canvas.update()
 
     def _on_first_roi_drawn(self, first_box: Tuple[int, int, int, int]):
         self.last_first_box = first_box
@@ -795,14 +997,6 @@ class ChamberCalibrationDialog(QDialog):
     def _toggle_mask(self):
         self.canvas.show_mask = not self.canvas.show_mask
         self.canvas.update()
-
-    def _on_auto_snap(self):
-        if self.sample_frame is not None:
-            calibrator = Interactive8ChamberCalibrator(self.sample_frame, [tuple(b) for b in self.canvas.boxes])
-            calibrator.auto_snap_chambers()
-            self.canvas.boxes = [list(b) for b in calibrator.boxes]
-            self.canvas._update_fly_detections()
-            self.canvas.update()
 
     def get_chambers(self) -> List[Tuple[int, int, int, int]]:
         return [tuple(b) for b in self.canvas.boxes]
