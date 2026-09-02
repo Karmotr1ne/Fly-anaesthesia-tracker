@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+dist/
+build/
+*.spec.bak
+
+# Node & Frontend
+node_modules/
+dist/
+.env
+.env.local
+.DS_Store
+
+# Data & Large Media
+*.mp4
+*.avi
+*.csv

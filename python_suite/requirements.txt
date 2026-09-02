@@ -1,0 +1,12 @@
+# Core Computer Vision & Scientific Stack
+numpy>=1.23.0
+scipy>=1.9.0
+pandas>=1.5.0
+opencv-python>=4.7.0
+matplotlib>=3.6.0
+
+# Desktop GUI Framework
+PyQt6>=6.4.0
+
+# Binary Packaging & Release
+pyinstaller>=5.8.0

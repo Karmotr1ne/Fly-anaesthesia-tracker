@@ -1,0 +1,8 @@
+{
+  "name": "Drosophila Anesthesia Tracker",
+  "description": "Integrated 8-Chamber Drosophila vision tracking, kinematic cleaning, anesthesia kinetics, and space-time kymograph analysis workbench (v0.1) with PyInstaller packaging support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
