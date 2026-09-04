@@ -1217,9 +1217,13 @@ class PipelineBatchWorker(QRunnable):
             has_csv = bool(paths.get("csv") and os.path.exists(paths.get("csv")))
             has_vid = bool(paths.get("video") and os.path.exists(paths.get("video")))
 
-            init_action = "Analyzing CSV" if has_csv else "Tracking Video"
+            phase_label = (
+                "Cleaning & State Analysis" if has_csv else SessionPhase.TRACKING.value
+            )
             self.signals.progress.emit(
-                processed, total_sessions, f"[{init_action}] {base} ({idx}/{total_sessions})..."
+                processed,
+                total_sessions,
+                f"[{phase_label}] {base} ({idx}/{total_sessions})..."
             )
 
             try:
@@ -1377,38 +1381,42 @@ class MainWindow(QMainWindow):
         grp_a.setLayout(vbox_a)
         right_layout.addWidget(grp_a)
 
-        # Module 4: Anesthesia Kinetics
-        grp_b = QGroupBox("Module 4: State Kinetics")
+# Module 4: 3-State Kinetics & Anesthesia
+        grp_b = QGroupBox("Module 4: 3-State Machine & Kinetics")
         vbox_b = QVBoxLayout()
         vbox_b.setSpacing(8)
 
-        self.cb_anesthesia = QCheckBox("Knockdown Latency & Recovery Time Analysis (*_anesthesia.csv)")
-        self.cb_anesthesia.setChecked(True)
-        vbox_b.addWidget(self.cb_anesthesia)
+        # 1. 速度衰减阈值比例
+        h_spd = QHBoxLayout()
+        h_spd.addWidget(QLabel("Sedate Speed Ratio:"))
+        self.spin_speed_ratio = QDoubleSpinBox()
+        self.spin_speed_ratio.setRange(0.05, 0.90)
+        self.spin_speed_ratio.setSingleStep(0.05)
+        self.spin_speed_ratio.setValue(0.35)
+        h_spd.addWidget(self.spin_speed_ratio)
+        vbox_b.addLayout(h_spd)
 
-        # 动态自定义时长选框布局
-        h_duration = QHBoxLayout()
-        lbl_duration = QLabel("Sedation Window (s):")
-        
-        self.spin_window_sec = QSpinBox()
-        self.spin_window_sec.setRange(120, 300)       # 2 到 5 分钟 (120s ~ 300s)
-        self.spin_window_sec.setSingleStep(5)        # 每次步进 5 秒（对应 1 个 bin）
-        self.spin_window_sec.setValue(120)           # 默认 120 秒
-        self.spin_window_sec.setSuffix(" s")
-        
-        # 实时显示对应分钟与 bin 数量
-        self.lbl_window_info = QLabel("(2.0 min, 24 bins)")
-        self.lbl_window_info.setStyleSheet("color: #64748B; font-size: 11px;")
-        
-        # 绑定值变化事件
-        self.spin_window_sec.valueChanged.connect(self._on_anesthesia_duration_changed)
+        # 2. 1秒单步跌落高度差阈值
+        h_drop = QHBoxLayout()
+        h_drop.addWidget(QLabel("Sedate Drop Height (1s):"))
+        self.spin_drop_thresh = QDoubleSpinBox()
+        self.spin_drop_thresh.setRange(0.05, 0.80)
+        self.spin_drop_thresh.setSingleStep(0.05)
+        self.spin_drop_thresh.setValue(0.25)
+        h_drop.addWidget(self.spin_drop_thresh)
+        vbox_b.addLayout(h_drop)
 
-        h_duration.addWidget(lbl_duration)
-        h_duration.addWidget(self.spin_window_sec)
-        h_duration.addWidget(self.lbl_window_info)
-        h_duration.addStretch()
+        # 3. 麻醉持续极值静止时长
+        h_still = QHBoxLayout()
+        h_still.addWidget(QLabel("Anaesthesia Window:"))
+        self.spin_still_sec = QSpinBox()
+        self.spin_still_sec.setRange(30, 600)
+        self.spin_still_sec.setSingleStep(10)
+        self.spin_still_sec.setValue(120)
+        self.spin_still_sec.setSuffix(" s")
+        h_still.addWidget(self.spin_still_sec)
+        vbox_b.addLayout(h_still)
 
-        vbox_b.addLayout(h_duration)
         grp_b.setLayout(vbox_b)
         right_layout.addWidget(grp_b)
 
@@ -1490,9 +1498,9 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(right_layout, 4)
 
     def sync_config_to_ui(self):
-        duration = getattr(self.config, "anesthesia_window_duration_sec", 120.0)
-        self.spin_window_sec.setValue(int(duration))
-        self._on_anesthesia_duration_changed(int(duration))
+        self.spin_speed_ratio.setValue(getattr(self.config, "sedate_speed_ratio", 0.35))
+        self.spin_drop_thresh.setValue(getattr(self.config, "sedate_drop_speed", 0.25))
+        self.spin_still_sec.setValue(int(getattr(self.config, "anesthesia_still_sec", 120.0)))
 
     def sync_ui_to_config(self):
         self.config.sedate_speed_ratio = float(self.spin_speed_ratio.value())
