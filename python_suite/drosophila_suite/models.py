@@ -23,24 +23,23 @@ class PipelineConfig:
     """Master pipeline configuration parameters for Drosophila Anesthesia Tracker."""
     fps: float = 30.0
     body_length_px: float = 12.0
-    body_length_thresh: float = 0.5    # 0.5 body lengths for micro-movement threshold
-    max_speed_px_per_sec: float = 400.0
-    max_speed_px_per_frame: float = 45.0
-    occlusion_disp_thresh: float = 80.0
-    occlusion_var_thresh: float = 8.0
+    body_length_thresh: float = 0.5    # 0.5 体长微动死区阈值
+    max_speed_px_per_frame: float = 45.0  # 单帧物理位移极限
+    occlusion_disp_thresh: float = 60.0   # 塞子边缘跳跃位移
+    occlusion_var_thresh: float = 5.0     # 塞子边缘停留方差
     savgol_window: int = 7
     savgol_poly: int = 2
     
     # Multi-Chamber Grid Defaults
     grid_rows: int = 4
     grid_cols: int = 2
-    grid_order: str = "column_first"   # "column_first" or "row_first"
-    
-    # Anesthesia Kinetics Parameters
-    anesthesia_bin_size_sec: float = 5.0
-    anesthesia_window_duration_sec: float = 120.0  # 判断窗口持续时间（秒），默认 120s
-    anesthesia_window_bins: int = 24                # 24 * 5s = 120s
-    anesthesia_activity_threshold: float = 0.01
+    grid_order: str = "column_first"
+
+    # ====== 新增：三阶段状态机参数 ======
+    sedate_speed_ratio: float = 0.35       # 速度低于基准 35% 计为镇静
+    sedate_drop_speed: float = 0.25        # 1s 内 norm_height 跌落差门限
+    anesthesia_still_sec: float = 120.0    # 连续静止 120s 计为麻醉深度击倒
+    anesthesia_speed_thresh: float = 0.1   # 麻醉静止速度门槛 (px/s)
 
     def to_dict(self) -> Dict[str, Any]:
         """Converts configuration dataclass to dictionary."""

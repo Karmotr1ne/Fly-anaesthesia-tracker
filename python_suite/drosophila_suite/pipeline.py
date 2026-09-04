@@ -117,17 +117,19 @@ class DrosophilaBehaviorPipeline:
         else:
             raise FileNotFoundError(f"Input file not found: {csv_path or video_path}")
 
-        # Step 2: Kinematic Cleaning & Artifact Clamping
+        # Step 2: Kinematic Cleaning & Artifact Clamping (含中点补全)
         cleaned_df = self.cleaner.clean_trajectory(raw_df)
+
+        # Step 3: 三阶段状态机判定
+        cleaned_df = self.anesthesia_analyzer.evaluate_states(cleaned_df)
+        
+        # 导出带状态的清洗总表
         cleaned_csv_path = f"{out_prefix}_cleaned.csv"
         if save_cleaned_csv:
             cleaned_df.to_csv(cleaned_csv_path, index=False)
 
-        # Step 3: Anesthesia Induction Kinetics
-        anesthesia_df = self.anesthesia_analyzer.evaluate_induction(cleaned_df, fps=self.config.fps)
-
-        # Step 4: Summary Metrics Consolidation
-        summary_df = anesthesia_df.copy()
+        # Step 4: 统计汇总表导出
+        summary_df = self.anesthesia_analyzer.extract_summary(cleaned_df)
         summary_csv_path = f"{out_prefix}_results_summary.csv"
         summary_df.to_csv(summary_csv_path, index=False)
 

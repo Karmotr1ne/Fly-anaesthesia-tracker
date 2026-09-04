@@ -380,9 +380,8 @@ class RobustGridAligner:
 
 class RobustFlyTracker:
     """
-    Centroid tracking with Darkness Mass Score, boundary rejection, and 1-based chamber indexing.
+    集成了 CLAHE 局部增强、双尺度黑帽变换与 OBB 几何过滤的果蝇高精度追踪器
     """
-
     def __init__(
         self,
         chamber_rois: List[Tuple[int, int, int, int]],
@@ -401,15 +400,21 @@ class RobustFlyTracker:
         heights = [max(20, b[3] - b[1]) for b in chamber_rois]
         avg_h = float(np.median(heights)) if heights else 80.0
 
+        # 基准面积动态估算
         self.target_fly_area = max(60.0, avg_h * avg_h * 0.08)
         self.min_area = min_fly_area if min_fly_area is not None else max(15.0, self.target_fly_area * 0.15)
         self.max_area = max_fly_area if max_fly_area is not None else max(400.0, self.target_fly_area * 6.0)
 
-        k_size = int(np.clip(avg_h * 0.22, 7, 31))
-        if k_size % 2 == 0:
-            k_size += 1
-        self.kernel_bh = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+        # 1. 初始化 CLAHE 算子（限制对比度局部自适应直方图均衡）
+        self.clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
 
+        # 2. 初始化双尺度黑帽核：小核适配微弱肢体/幼小体态，大核覆盖躯干
+        k_small = max(5, int(avg_h * 0.10) | 1)
+        k_large = max(11, int(avg_h * 0.25) | 1)
+        self.kernel_bh_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_small, k_small))
+        self.kernel_bh_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_large, k_large))
+
+        # 状态记录
         self.last_known_pos: Dict[int, Optional[Tuple[float, float]]] = {cid: None for cid in self.chamber_ids}
         self.trajectory_history: Dict[int, List[Tuple[float, float]]] = {cid: [] for cid in self.chamber_ids}
         self.last_debug_masks: Dict[int, np.ndarray] = {}
@@ -418,7 +423,6 @@ class RobustFlyTracker:
         self.executor = ThreadPoolExecutor(max_workers=workers)
 
     def close(self):
-        """Releases thread pool resources."""
         if hasattr(self, "executor") and self.executor:
             self.executor.shutdown(wait=False)
 
@@ -438,37 +442,81 @@ class RobustFlyTracker:
         if h < 5 or w < 10:
             return None, np.zeros((1, 1), dtype=np.uint8)
 
-        # Border protection mask (reject outer boundary seam artifacts)
+        # 管腔内壁边缘保护掩码（内缩 1~2px，屏蔽管壁死角反射条纹）
         border_mask = np.zeros((h, w), dtype=np.uint8)
-        border_mask[1:h - 1, 1:w - 1] = 255
+        pad_y = max(1, int(h * 0.04))
+        pad_x = max(1, int(w * 0.02))
+        border_mask[pad_y : h - pad_y, pad_x : w - pad_x] = 255
 
-        # Background subtraction for dark moving object extraction
+        # -----------------------------------------------------------------
+        # 步骤 1: CLAHE 局部对比度增强（消除暗区低动态范围缺陷）
+        # -----------------------------------------------------------------
+        chamber_enhanced = self.clahe.apply(chamber_crop)
+
+        # -----------------------------------------------------------------
+        # 步骤 2: 双尺度黑帽变换（滤除平缓暗阴影，高亮细小暗目标）
+        # -----------------------------------------------------------------
+        bh_s = cv2.morphologyEx(chamber_enhanced, cv2.MORPH_BLACKHAT, self.kernel_bh_small)
+        bh_l = cv2.morphologyEx(chamber_enhanced, cv2.MORPH_BLACKHAT, self.kernel_bh_large)
+        # 加权融合：小核保证轮廓边缘锐利，大核保证虫体中心饱满
+        bh_energy = cv2.addWeighted(bh_s, 0.6, bh_l, 0.4, 0.0)
+
+        # -----------------------------------------------------------------
+        # 步骤 3: 能量图加权融合（黑帽暗斑能量 + 背景差分流）
+        # -----------------------------------------------------------------
         if bg_crop is not None and bg_crop.shape == chamber_crop.shape:
-            diff = cv2.subtract(bg_crop, chamber_crop)
+            bg_enhanced = self.clahe.apply(bg_crop)
+            diff_bg = cv2.subtract(bg_enhanced, chamber_enhanced)
         else:
-            diff = cv2.bitwise_not(chamber_crop)
+            diff_bg = cv2.bitwise_not(chamber_enhanced)
 
-        blurred = cv2.GaussianBlur(diff, (3, 3), 0)
+        # 50% 差分流 + 50% 黑帽流
+        fused_diff = cv2.addWeighted(diff_bg, 0.5, bh_energy, 0.5, 0.0)
+
+        # -----------------------------------------------------------------
+        # 步骤 4: 滤波二值化与形态学闭合
+        # -----------------------------------------------------------------
+        blurred = cv2.GaussianBlur(fused_diff, (3, 3), 0)
         _, mask = cv2.threshold(blurred, self.diff_thresh, 255, cv2.THRESH_BINARY)
         mask = cv2.bitwise_and(mask, border_mask)
-        
+
         kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+        # -----------------------------------------------------------------
+        # 步骤 5: 提取连通域，利用 OBB 几何约束过滤假边缘并提取参数
+        # -----------------------------------------------------------------
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         candidates = []
         last_pos = self.last_known_pos.get(cid, None)
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if self.min_area <= area <= self.max_area:
-                M = cv2.moments(cnt)
-                if M["m00"] == 0:
-                    continue
-                cx = M["m10"] / M["m00"]
-                cy = M["m01"] / M["m00"]
+                # 纯计算几何求解有向最小外接矩形 (OBB)
+                # rect 返回: ((center_x, center_y), (width, height), angle_deg)
+                rect = cv2.minAreaRect(cnt)
+                (cx, cy), (rw, rh), angle = rect
 
-                # Continuity weighting based on distance to previous frame
+                if rw <= 0 or rh <= 0:
+                    continue
+
+                major_axis = max(rw, rh)  # 果蝇体长 (长轴)
+                minor_axis = min(rw, rh)  # 果蝇体宽 (短轴)
+                aspect_ratio = major_axis / max(1e-3, minor_axis)
+
+                # OBB 几何准则过滤：
+                # 1. 长宽比过滤：果蝇正常爬行长宽比在 1.4 ~ 4.2 之间；剔除接缝条纹 (> 4.5) 或极扁噪斑
+                if aspect_ratio < 1.3 or aspect_ratio > 4.5:
+                    continue
+
+                # 2. 矩形填充率 (Extent) 过滤：果蝇椭圆躯干占 OBB 面积比例通常在 0.5 ~ 0.9 之间
+                obb_area = major_axis * minor_axis
+                extent = area / obb_area if obb_area > 0 else 0
+                if extent < 0.40:
+                    continue
+
+                # 计算时序连续性衰减打分
                 s_dist = 1.0
                 if last_pos is not None:
                     abs_cx = roi_box[0] + cx
@@ -476,9 +524,17 @@ class RobustFlyTracker:
                     d = np.hypot(abs_cx - last_pos[0], abs_cy - last_pos[1])
                     s_dist = np.exp(-d / 70.0)
 
+                # 提取 OBB 4 个顶点坐标备用 (顺时针/逆时针矩形角点)
+                box_pts = cv2.boxPoints(rect)
+
                 candidates.append({
                     "local_pos": (cx, cy),
                     "area": area,
+                    "major_len": major_axis,
+                    "minor_len": minor_axis,
+                    "aspect_ratio": aspect_ratio,
+                    "angle": angle,
+                    "obb_box": box_pts,
                     "score": area * s_dist
                 })
 
@@ -551,6 +607,11 @@ class RobustFlyTracker:
                     "roi_x2": orig_x2,
                     "roi_y2": orig_y2,
                     "area": round(candidate["area"], 1),
+                    # 新增由 OBB 提取出的真实物理几何字段
+                    "body_len_px": round(candidate["major_len"], 2),
+                    "body_width_px": round(candidate["minor_len"], 2),
+                    "aspect_ratio": round(candidate["aspect_ratio"], 2),
+                    "angle_deg": round(candidate["angle"], 2),
                     "is_interpolated": 0
                 })
             else:
@@ -568,6 +629,10 @@ class RobustFlyTracker:
                     "roi_x2": orig_x2,
                     "roi_y2": orig_y2,
                     "area": np.nan,
+                    "body_len_px": np.nan,
+                    "body_width_px": np.nan,
+                    "aspect_ratio": np.nan,
+                    "angle_deg": np.nan,
                     "is_interpolated": 0
                 })
 

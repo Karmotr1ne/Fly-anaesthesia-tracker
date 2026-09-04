@@ -720,31 +720,39 @@ class InteractiveChamberCanvas(QWidget):
 
 
 class ChamberCalibrationDialog(QDialog):
-    """
-    Interactive Multi-Chamber Grid Calibration Dialog:
-    Supports manual first ROI inference, 8-way handle stretching, link modes, and auto-snap.
-    """
     def __init__(self, video_path: str, parent=None, initial_chambers=None, rows: int = 4, cols: int = 2, order: str = "column_first"):
         super().__init__(parent)
         self.setWindowTitle(f"Multi-Chamber Grid Calibrator - {os.path.basename(video_path)}")
         self.resize(1120, 720)
         self.video_path = video_path
         self.sample_frame = None
-        self.rows = max(1, rows)
-        self.cols = max(1, cols)
         self.order = order
         self.last_first_box = None
+
+        # 核心防护：若已有选框，以已有选框数量为主
+        if initial_chambers and len(initial_chambers) > 0:
+            self.boxes = [list(b) for b in initial_chambers]
+            self.last_first_box = tuple(self.boxes[0])
+            # 如果已有数量与传入行列不符，维持传入 rows，动态适配 cols
+            if len(self.boxes) != (rows * cols):
+                self.rows = rows
+                self.cols = max(1, len(self.boxes) // rows)
+            else:
+                self.rows = rows
+                self.cols = cols
+        else:
+            self.boxes = []
+            self.rows = max(1, rows)
+            self.cols = max(1, cols)
 
         self._load_video_sample()
         self._setup_ui()
 
-        if initial_chambers and len(initial_chambers) == (self.rows * self.cols):
-            self.boxes = [list(b) for b in initial_chambers]
-            self.last_first_box = tuple(self.boxes[0])
+        if self.boxes:
             self.canvas.set_data(self.sample_frame, self.boxes, self.rows, self.cols)
             self._rebuild_chamber_buttons()
+            self.tip_label.setText(f"<b>Loaded {len(self.boxes)} calibrated chambers</b>.")
         else:
-            self.boxes = []
             self.canvas.set_data(self.sample_frame, [], self.rows, self.cols)
             self.canvas.start_redraw_first_roi()
 
@@ -1351,32 +1359,6 @@ class MainWindow(QMainWindow):
         header_tasks = QLabel("<b>3. Modules & Analysis Settings</b>")
         right_layout.addWidget(header_tasks)
 
-        # Grid Geometry
-        grp_grid = QGroupBox("Multi-Chamber Geometry")
-        vbox_grid = QVBoxLayout()
-        h_grid_row = QHBoxLayout()
-        h_grid_row.addWidget(QLabel("Rows:"))
-        self.spin_rows = QSpinBox()
-        self.spin_rows.setRange(1, 32)
-        self.spin_rows.setValue(4)
-        h_grid_row.addWidget(self.spin_rows)
-
-        h_grid_row.addWidget(QLabel("Cols:"))
-        self.spin_cols = QSpinBox()
-        self.spin_cols.setRange(1, 16)
-        self.spin_cols.setValue(2)
-        h_grid_row.addWidget(self.spin_cols)
-        vbox_grid.addLayout(h_grid_row)
-
-        h_order_row = QHBoxLayout()
-        h_order_row.addWidget(QLabel("Chamber Ordering:"))
-        self.combo_order = QComboBox()
-        self.combo_order.addItems(["Column-first (1..N)", "Row-first (1..N)"])
-        h_order_row.addWidget(self.combo_order)
-        vbox_grid.addLayout(h_order_row)
-        grp_grid.setLayout(vbox_grid)
-        right_layout.addWidget(grp_grid)
-
         # Module 1: Vision Tracking
         grp_track = QGroupBox("Module 1: Fly Tracking")
         vbox_track = QVBoxLayout()
@@ -1508,21 +1490,14 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(right_layout, 4)
 
     def sync_config_to_ui(self):
-        self.spin_rows.setValue(self.config.grid_rows)
-        self.spin_cols.setValue(self.config.grid_cols)
-        order_idx = 0 if self.config.grid_order == "column_first" else 1
-        self.combo_order.setCurrentIndex(order_idx)
         duration = getattr(self.config, "anesthesia_window_duration_sec", 120.0)
         self.spin_window_sec.setValue(int(duration))
         self._on_anesthesia_duration_changed(int(duration))
 
     def sync_ui_to_config(self):
-        self.config.grid_rows = self.spin_rows.value()
-        self.config.grid_cols = self.spin_cols.value()
-        self.config.grid_order = "column_first" if self.combo_order.currentIndex() == 0 else "row_first"
-        val = self.spin_window_sec.value()
-        self.config.anesthesia_window_duration_sec = float(val)
-        self.config.anesthesia_window_bins = max(1, int(round(val / self.config.anesthesia_bin_size_sec)))
+        self.config.sedate_speed_ratio = float(self.spin_speed_ratio.value())
+        self.config.sedate_drop_speed = float(self.spin_drop_thresh.value())
+        self.config.anesthesia_still_sec = float(self.spin_still_sec.value())
 
     def on_files_updated(self, files):
         self.pair_list.clear()
@@ -1565,34 +1540,41 @@ class MainWindow(QMainWindow):
         if row < 0 and self.matched_pairs:
             row = 0
         if row < 0 or not self.matched_pairs:
-            QMessageBox.information(self, "Select Session", "Please drag and select a video session to calibrate chamber ROIs.")
+            QMessageBox.information(self, "Select Session", "Please select a video session to calibrate.")
             return
-        base_keys = list(self.matched_pairs.keys())
-        if row >= len(base_keys):
-            return
-        base = base_keys[row]
+        base = list(self.matched_pairs.keys())[row]
         session = self.matched_pairs[base]
         vid_path = session.get("video")
         if not vid_path:
-            QMessageBox.information(self, "No Video", f"Session '{base}' does not contain an associated video file.")
+            QMessageBox.information(self, "No Video", f"Session '{base}' does not contain a video file.")
             return
 
-        self.sync_ui_to_config()
+        # 从当前会话读取几何参数（若无则兜底使用全局默认 4x2）
+        cur_rois = session.get("chamber_rois")
+        cur_rows = session.get("grid_rows", self.config.grid_rows)
+        cur_cols = session.get("grid_cols", self.config.grid_cols)
+        cur_order = session.get("grid_order", self.config.grid_order)
+
         dlg = ChamberCalibrationDialog(
             vid_path,
             parent=self,
-            initial_chambers=session.get("chamber_rois"),
-            rows=self.config.grid_rows,
-            cols=self.config.grid_cols,
-            order=self.config.grid_order
+            initial_chambers=cur_rois,
+            rows=cur_rows,
+            cols=cur_cols,
+            order=cur_order
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
+            # 将弹窗中最终确认的 ROI 坐标与几何参数一并固化到该 session
             rois = dlg.get_chambers()
-            self.matched_pairs[base]["chamber_rois"] = rois
+            session["chamber_rois"] = rois
+            session["grid_rows"] = dlg.rows
+            session["grid_cols"] = dlg.cols
+            session["grid_order"] = dlg.order
+            
             QMessageBox.information(
                 self,
                 "Calibration Saved",
-                f"Successfully saved {len(rois)} chamber bounding boxes for:\n{base}"
+                f"Successfully saved {len(rois)} chambers ({dlg.rows}x{dlg.cols}) for:\n{base}"
             )
 
     def clear_all(self):
