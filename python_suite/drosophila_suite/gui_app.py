@@ -166,13 +166,23 @@ class InteractiveChamberCanvas(QWidget):
 
     def set_data(self, frame: np.ndarray, boxes: List[List[int]], rows: int = 4, cols: int = 2):
         self.sample_frame = frame
+        self.cached_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame is not None else None
+        self.cached_mask_vis = None
+        self.cached_qimage_base = None
+        self.cached_qimage_mask = None
+        
+        # 预先生成基础彩图 QImage，避免 paintEvent 重复转换
+        if self.sample_frame is not None:
+            rgb_base = cv2.cvtColor(self.sample_frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_base.shape
+            self.cached_qimage_base = QImage(rgb_base.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
+
         self.boxes = [list(b) for b in boxes]
         self.rows = rows
         self.cols = cols
         self.is_drawing_first = (len(self.boxes) == 0)
         self.undo_stack.clear()
         
-        # 默认选中第 1 个 chamber
         if self.boxes:
             self.selected_idx = 0
             self.selected_indices = {0}
@@ -183,6 +193,132 @@ class InteractiveChamberCanvas(QWidget):
         self._update_fly_detections()
         self.selectionChanged.emit(len(self.selected_indices))
         self.update()
+
+    def _get_mask_qimage(self) -> Optional[QImage]:
+        """缓存掩码图对应的 QImage，避免重复生成"""
+        if self.cached_qimage_mask is not None:
+            return self.cached_qimage_mask
+        vis = self._get_mask_visualization()
+        if vis is None:
+            return None
+        rgb_mask = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_mask.shape
+        self.cached_qimage_mask = QImage(rgb_mask.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
+        return self.cached_qimage_mask
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        if self.sample_frame is None or self.cached_qimage_base is None:
+            painter.setPen(QColor("#64748B"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No video frame available")
+            return
+
+        s, ox, oy = self.get_scale_and_offsets()
+        img_h, img_w = self.sample_frame.shape[:2]
+
+        # 直接渲染缓存好的 QImage，彻底消除逐帧 CPU 颜色转换
+        qimg = self._get_mask_qimage() if self.show_mask else self.cached_qimage_base
+        if qimg:
+            painter.drawImage(QRectF(ox, oy, img_w * s, img_h * s), qimg)
+
+        # 中轴参考线
+        mid_x = ox + (img_w * 0.5) * s
+        painter.setPen(QPen(QColor("#94A3B8"), 1, Qt.PenStyle.DashLine))
+        painter.drawLine(int(mid_x), int(oy), int(mid_x), int(oy + img_h * s))
+
+        # 首次绘制引导
+        if self.is_drawing_first and self.current_drawing_rect:
+            x1, y1, x2, y2 = self.current_drawing_rect
+            rx1, ry1 = self.img_to_canvas(x1, y1)
+            rx2, ry2 = self.img_to_canvas(x2, y2)
+            painter.setPen(QPen(QColor("#F59E0B"), 2, Qt.PenStyle.DashLine))
+            painter.setBrush(QBrush(QColor(245, 158, 11, 40)))
+            painter.drawRect(QRectF(rx1, ry1, rx2 - rx1, ry2 - ry1))
+            painter.setPen(QColor("#FDE68A"))
+            painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+            painter.drawText(int(rx1 + 6), int(ry1 + 18), "CH 1 (Release mouse to infer grid)")
+            return
+
+        font_label = QFont("Arial", 9, QFont.Weight.Bold)
+        font_dim = QFont("Arial", 8)
+
+        # 批量绘制所有 Chamber
+        for idx, (x1, y1, x2, y2) in enumerate(self.boxes):
+            cid = idx + 1
+            is_active = (idx == self.selected_idx)
+            is_in_group = (idx in self.selected_indices)
+
+            rx1, ry1 = self.img_to_canvas(x1, y1)
+            rx2, ry2 = self.img_to_canvas(x2, y2)
+            rw, rh = rx2 - rx1, ry2 - ry1
+
+            if is_active:
+                border_color = QColor("#F59E0B")
+                fill_color = QColor(245, 158, 11, 35)
+                line_w = 2.5
+            elif is_in_group:
+                border_color = QColor("#38BDF8")
+                fill_color = QColor(56, 189, 248, 25)
+                line_w = 2.0
+            else:
+                border_color = QColor("#10B981")
+                fill_color = QColor(16, 185, 129, 15)
+                line_w = 1.2
+
+            painter.setPen(QPen(border_color, line_w))
+            painter.setBrush(QBrush(fill_color))
+            painter.drawRoundedRect(QRectF(rx1, ry1, rw, rh), 4, 4)
+
+            # ID Badge
+            tag_rect = QRectF(rx1 + 4, ry1 + 4, 48, 18)
+            painter.setPen(Qt.PenStyle.NoPen)
+            badge_bg = QColor("#D97706") if is_active else (QColor("#0284C7") if is_in_group else QColor("#0F172A"))
+            painter.setBrush(QBrush(badge_bg))
+            painter.drawRoundedRect(tag_rect, 3, 3)
+
+            painter.setPen(QColor("#FFFFFF"))
+            painter.setFont(font_label)
+            painter.drawText(tag_rect, Qt.AlignmentFlag.AlignCenter, f"CH {cid}")
+
+            if is_active:
+                painter.setFont(font_dim)
+                painter.setPen(QColor("#FDE68A"))
+                painter.drawText(int(rx1 + 56), int(ry1 + 17), f"{int(x2 - x1)}x{int(y2 - y1)} px")
+
+            # 十字质心
+            if cid in self.fly_centroids and self.fly_centroids[cid] is not None:
+                fx, fy = self.fly_centroids[cid]
+                cfx, cfy = self.img_to_canvas(fx, fy)
+                painter.setPen(QPen(QColor("#22C55E"), 1))
+                painter.drawLine(int(cfx - 7), int(cfy), int(cfx + 7), int(cfy))
+                painter.drawLine(int(cfx), int(cfy - 7), int(cfx), int(cfy + 7))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(QColor("#EF4444")))
+                painter.drawEllipse(QPointF(cfx, cfy), 3.5, 3.5)
+
+            # 调节手柄
+            if is_active:
+                h_size = 7
+                painter.setBrush(QBrush(QColor("#FFFFFF")))
+                painter.setPen(QPen(QColor("#F59E0B"), 1.5))
+                handle_points = [
+                    (rx1, ry1), ((rx1 + rx2) / 2, ry1), (rx2, ry1),
+                    (rx1, (ry1 + ry2) / 2), (rx2, (ry1 + ry2) / 2),
+                    (rx1, ry2), ((rx1 + rx2) / 2, ry2), (rx2, ry2)
+                ]
+                for px, py in handle_points:
+                    painter.drawRect(QRectF(px - h_size / 2, py - h_size / 2, h_size, h_size))
+
+        # 框选矩形
+        if self.is_box_selecting and self.current_select_rect_img:
+            x1, y1, x2, y2 = self.current_select_rect_img
+            rx1, ry1 = self.img_to_canvas(x1, y1)
+            rx2, ry2 = self.img_to_canvas(x2, y2)
+            painter.setPen(QPen(QColor("#38BDF8"), 1.5, Qt.PenStyle.DashLine))
+            painter.setBrush(QBrush(QColor(56, 189, 248, 45)))
+            painter.drawRect(QRectF(rx1, ry1, rx2 - rx1, ry2 - ry1))
 
     def start_redraw_first_roi(self):
         self._push_undo()
@@ -943,10 +1079,6 @@ class ChamberCalibrationDialog(QDialog):
         self.canvas.boxChanged.emit()
         self.canvas.update()
 
-    def _on_first_roi_drawn(self, first_box: Tuple[int, int, int, int]):
-        self.last_first_box = first_box
-        self._recompute_inference()
-
     def _on_grid_dims_changed(self):
         self.rows = self.spin_rows.value()
         self.cols = self.spin_cols.value()
@@ -1102,10 +1234,11 @@ class TrackingOnlyWorker(QRunnable):
     """
     Dedicated worker for batch video vision tracking, producing *_raw.csv.
     """
-    def __init__(self, matched_pairs: Dict[str, dict], config: PipelineConfig):
+    def __init__(self, matched_pairs: Dict[str, dict], config: PipelineConfig, save_raw_csv: bool = True):
         super().__init__()
         self.matched_pairs = matched_pairs
         self.config = config
+        self.save_raw_csv = save_raw_csv
         self.signals = WorkerSignals()
         self._is_cancelled = False
 
@@ -1144,14 +1277,13 @@ class TrackingOnlyWorker(QRunnable):
             out_dir = os.path.dirname(os.path.abspath(vid_path))
             raw_csv_path = os.path.join(out_dir, f"{base}_raw.csv")
 
-            start_t = time.time()
-            last_t = [start_t]
+            last_t = [time.time()]
 
             def on_frame_progress(f_cur, f_tot):
-                if f_tot > 0:
+                if f_tot > 0 and (f_cur % 15 == 0 or f_cur == f_tot):
                     curr_t = time.time()
                     dt = max(1e-5, curr_t - last_t[0])
-                    fps_val = 100.0 / dt
+                    fps_val = 15.0 / dt
                     last_t[0] = curr_t
                     pct = int((f_cur / f_tot) * 100)
                     self.signals.progress.emit(
@@ -1163,10 +1295,15 @@ class TrackingOnlyWorker(QRunnable):
             try:
                 tracker = FlyVisionTracker(chamber_rois=ch_rois)
                 raw_df = tracker.track_video(vid_path, progress_callback=on_frame_progress)
-                raw_df.to_csv(raw_csv_path, index=False)
                 
-                paths["csv"] = raw_csv_path
-                all_results[base] = {"raw_csv": raw_csv_path, "frames": len(raw_df)}
+                # 只有明确保存了文件才指向 csv，避免 paths['csv'] 处于悬空状态
+                if self.save_raw_csv:
+                    raw_df.to_csv(raw_csv_path, index=False)
+                    paths["csv"] = raw_csv_path
+                else:
+                    paths["csv"] = None  # 明确设为 None，强制后续流程按需处理
+                
+                all_results[base] = {"raw_csv": raw_csv_path if self.save_raw_csv else None, "frames": len(raw_df)}
                 processed += 1
                 self.signals.session_finished.emit(base, all_results[base])
                 self.signals.progress.emit(processed, total_sessions, f"Finished video tracking: {base} ({processed}/{total_sessions})")
@@ -1184,15 +1321,19 @@ class PipelineBatchWorker(QRunnable):
         self,
         matched_pairs: Dict[str, dict],
         config: PipelineConfig,
+        save_raw_csv: bool = True,
         save_cleaned_csv: bool = True,
-        generate_plots: bool = True,
+        plot_act_pos: bool = True,
+        plot_kymo: bool = True,
         render_video_overlay: bool = False,
     ):
         super().__init__()
         self.matched_pairs = matched_pairs
         self.config = config
+        self.save_raw_csv = save_raw_csv
         self.save_cleaned_csv = save_cleaned_csv
-        self.generate_plots = generate_plots
+        self.plot_act_pos = plot_act_pos
+        self.plot_kymo = plot_kymo
         self.render_video_overlay = render_video_overlay
         self.signals = WorkerSignals()
         self._is_cancelled = False
@@ -1217,9 +1358,7 @@ class PipelineBatchWorker(QRunnable):
             has_csv = bool(paths.get("csv") and os.path.exists(paths.get("csv")))
             has_vid = bool(paths.get("video") and os.path.exists(paths.get("video")))
 
-            phase_label = (
-                "Cleaning & State Analysis" if has_csv else SessionPhase.TRACKING.value
-            )
+            phase_label = "Cleaning & State Analysis" if has_csv else SessionPhase.TRACKING.value
             self.signals.progress.emit(
                 processed,
                 total_sessions,
@@ -1242,7 +1381,7 @@ class PipelineBatchWorker(QRunnable):
                         ch_rois = [c["roi"] for c in chamber_configs]
 
                 def on_tracking_progress(f_cur, f_tot):
-                    if f_tot > 0:
+                    if f_tot > 0 and (f_cur % 20 == 0 or f_cur == f_tot):
                         pct = int((f_cur / f_tot) * 100)
                         self.signals.progress.emit(
                             processed,
@@ -1251,7 +1390,7 @@ class PipelineBatchWorker(QRunnable):
                         )
 
                 def on_rendering_progress(f_cur, f_tot):
-                    if f_tot > 0:
+                    if f_tot > 0 and (f_cur % 10 == 0 or f_cur == f_tot):
                         pct = int((f_cur / f_tot) * 100)
                         self.signals.progress.emit(
                             processed,
@@ -1259,13 +1398,15 @@ class PipelineBatchWorker(QRunnable):
                             f"[{SessionPhase.RENDERING.value}] {base}: {pct}% ({f_cur}/{f_tot} frames)"
                         )
 
+                # 将细化的保存/绘图选项传递给 pipeline
                 res = pipeline.process_file_pair(
                     csv_path=paths.get("csv"),
                     video_path=paths.get("video"),
                     base_name=base,
                     chamber_rois=ch_rois,
+                    save_raw_csv=self.save_raw_csv,
                     save_cleaned_csv=self.save_cleaned_csv,
-                    generate_plots=self.generate_plots,
+                    generate_plots=(self.plot_act_pos or self.plot_kymo),
                     render_video_overlay=self.render_video_overlay,
                     progress_callback=on_tracking_progress,
                     render_progress_callback=on_rendering_progress
@@ -1381,7 +1522,7 @@ class MainWindow(QMainWindow):
         grp_a.setLayout(vbox_a)
         right_layout.addWidget(grp_a)
 
-# Module 4: 3-State Kinetics & Anesthesia
+    # Module 4: 3-State Kinetics & Anesthesia
         grp_b = QGroupBox("Module 4: 3-State Machine & Kinetics")
         vbox_b = QVBoxLayout()
         vbox_b.setSpacing(8)
@@ -1416,6 +1557,17 @@ class MainWindow(QMainWindow):
         self.spin_still_sec.setSuffix(" s")
         h_still.addWidget(self.spin_still_sec)
         vbox_b.addLayout(h_still)
+
+        # 静止绝对速度阈值
+        h_thresh = QHBoxLayout()
+        h_thresh.addWidget(QLabel("Anaesthesia Speed Thresh:"))
+        self.spin_speed_thresh = QDoubleSpinBox()
+        self.spin_speed_thresh.setRange(0.01, 2.0)
+        self.spin_speed_thresh.setSingleStep(0.05)
+        self.spin_speed_thresh.setValue(0.10)
+        self.spin_speed_thresh.setSuffix(" px/s")
+        h_thresh.addWidget(self.spin_speed_thresh)
+        vbox_b.addLayout(h_thresh)
 
         grp_b.setLayout(vbox_b)
         right_layout.addWidget(grp_b)
@@ -1501,11 +1653,13 @@ class MainWindow(QMainWindow):
         self.spin_speed_ratio.setValue(getattr(self.config, "sedate_speed_ratio", 0.35))
         self.spin_drop_thresh.setValue(getattr(self.config, "sedate_drop_speed", 0.25))
         self.spin_still_sec.setValue(int(getattr(self.config, "anesthesia_still_sec", 120.0)))
+        self.spin_speed_thresh.setValue(float(getattr(self.config, "anesthesia_speed_thresh", 0.10)))
 
     def sync_ui_to_config(self):
         self.config.sedate_speed_ratio = float(self.spin_speed_ratio.value())
         self.config.sedate_drop_speed = float(self.spin_drop_thresh.value())
         self.config.anesthesia_still_sec = float(self.spin_still_sec.value())
+        self.config.anesthesia_speed_thresh = float(self.spin_speed_thresh.value())
 
     def on_files_updated(self, files):
         self.pair_list.clear()
@@ -1592,11 +1746,6 @@ class MainWindow(QMainWindow):
         self.drop_area.label.setText("Drag & Drop CSV or Video files here\n(or click to browse)")
         self.lbl_status.setText("Ready, awaiting task execution.")
 
-    def _on_anesthesia_duration_changed(self, val: int):
-        bins = max(1, int(round(val / self.config.anesthesia_bin_size_sec)))
-        minutes = val / 60.0
-        self.lbl_window_info.setText(f"({minutes:.1f} min, {bins} bins)")
-
     def cancel_execution(self):
         if self.current_worker:
             self.lbl_status.setText("Cancelling task execution...")
@@ -1639,8 +1788,10 @@ class MainWindow(QMainWindow):
         worker = PipelineBatchWorker(
             matched_pairs=self.matched_pairs,
             config=self.config,
+            save_raw_csv=self.cb_save_raw.isChecked(),
             save_cleaned_csv=self.cb_save_clean.isChecked(),
-            generate_plots=(self.cb_plot_act_pos.isChecked() or self.cb_plot_kymo.isChecked()),
+            plot_act_pos=self.cb_plot_act_pos.isChecked(),
+            plot_kymo=self.cb_plot_kymo.isChecked(),
             render_video_overlay=self.cb_video_overlay.isChecked(),
         )
         worker.signals.progress.connect(self.on_worker_progress)
@@ -1664,7 +1815,8 @@ class MainWindow(QMainWindow):
 
         worker = TrackingOnlyWorker(
             matched_pairs=self.matched_pairs,
-            config=self.config
+            config=self.config,
+            save_raw_csv=self.cb_save_raw.isChecked()
         )
         worker.signals.progress.connect(self.on_worker_progress)
         worker.signals.session_finished.connect(self.on_tracking_session_finished)
