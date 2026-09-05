@@ -1681,6 +1681,47 @@ class MainWindow(QMainWindow):
         vid_map = {extract_base_name(f): f for f in vids}
 
         all_bases = sorted(set(csv_map.keys()) | set(vid_map.keys()))
+        has_any_video_awaiting_tracking = False
+
+        for base in all_bases:
+            has_csv = base in csv_map
+            has_vid = base in vid_map
+            if has_csv and has_vid:
+                status = "[Paired] CSV + Video"
+                self.matched_pairs[base] = {"csv": csv_map[base], "video": vid_map[base]}
+            elif has_csv and not has_vid:
+                status = "[CSV Data Only]"
+                self.matched_pairs[base] = {"csv": csv_map[base], "video": None}
+            elif not has_csv and has_vid:
+                status = "[Video Awaiting Tracking]"
+                self.matched_pairs[base] = {"csv": None, "video": vid_map[base]}
+                has_any_video_awaiting_tracking = True
+            else:
+                continue
+            self.pair_list.addItem(f"{base}  ->  {status}")
+
+        # 若导入的都是已有 CSV，禁用 Export Raw 复选框；有待追踪视频时才启用
+        if not has_any_video_awaiting_tracking and all_bases:
+            self.cb_save_raw.setEnabled(False)
+            self.cb_save_raw.setToolTip("Input is already CSV data. Raw CSV export only applies to video tracking.")
+        else:
+            self.cb_save_raw.setEnabled(True)
+            self.cb_save_raw.setToolTip(None)
+            
+        def extract_base_name(file_path: str) -> str:
+            name = os.path.splitext(os.path.basename(file_path))[0]
+            pattern = r"(_tracked|_raw|_cleaned|_v\d+|_overlay|_filtered)$"
+            while True:
+                new_name = re.sub(pattern, "", name, flags=re.IGNORECASE)
+                if new_name == name:
+                    break
+                name = new_name
+            return name.strip()
+
+        csv_map = {extract_base_name(f): f for f in csvs}
+        vid_map = {extract_base_name(f): f for f in vids}
+
+        all_bases = sorted(set(csv_map.keys()) | set(vid_map.keys()))
         for base in all_bases:
             has_csv = base in csv_map
             has_vid = base in vid_map

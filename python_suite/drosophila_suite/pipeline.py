@@ -46,6 +46,7 @@ class DrosophilaBehaviorPipeline:
         video_path: Optional[str] = None,
         output_dir: Optional[str] = None,
         base_name: Optional[str] = None,
+        save_raw_csv: bool = True,
         save_cleaned_csv: bool = True,
         generate_plots: bool = True,
         render_video_overlay: bool = False,
@@ -69,29 +70,51 @@ class DrosophilaBehaviorPipeline:
                     base_name = base_name[: -len(suffix)]
 
         out_prefix = os.path.join(target_dir, base_name)
+        raw_csv_target_path = f"{out_prefix}_raw.csv"
 
-        # 阶段 1 & 3: 提取或读取 raw 坐标
+        # -----------------------------------------------------------------
+        # 阶段 1: 判定数据源（优先直接加载已有 CSV，无 CSV 时才触发 CV 跟踪）
+        # -----------------------------------------------------------------
+        is_freshly_tracked = False
+
         if csv_path and os.path.exists(csv_path):
+            # 直接从已有 CSV（如 *_raw.csv）加载数据，跳过耗时追踪
             raw_df = pd.read_csv(csv_path)
+            raw_csv_path = csv_path
         elif video_path and os.path.exists(video_path):
+            # 只有当缺少 CSV 且存在视频时，才调用视觉追踪
             if not chamber_rois:
-                raise ValueError("Chamber ROIs required for video tracking.")
+                raise ValueError(f"Chamber ROIs required for video tracking on {base_name}.")
             tracker = FlyVisionTracker(chamber_rois=chamber_rois)
             raw_df = tracker.track_video(video_path, progress_callback=progress_callback)
-            raw_df.to_csv(f"{out_prefix}_raw.csv", index=False)
+            is_freshly_tracked = True
+            raw_csv_path = raw_csv_target_path
         else:
             raise FileNotFoundError(f"Input file not found: {csv_path or video_path}")
 
-        # 阶段 4: 运动学清洗与前后中点缺失填充
+        # -----------------------------------------------------------------
+        # 核心解突机制：只有“新追踪出的数据”且“用户勾选保存”时才写入磁盘；
+        # 若本就是从 raw.csv 读进来的，绝不执行覆盖写入！
+        # -----------------------------------------------------------------
+        if is_freshly_tracked and save_raw_csv:
+            raw_df.to_csv(raw_csv_target_path, index=False)
+
+        # -----------------------------------------------------------------
+        # 阶段 2: 运动学清洗与前后中点补全
+        # -----------------------------------------------------------------
         cleaned_df = self.cleaner.clean_trajectory(raw_df)
 
-        # 阶段 5: 三阶段非强制连续状态机判定 (Active -> Sedate -> Anaesthesia)
+        # -----------------------------------------------------------------
+        # 阶段 3: 三阶段动态状态机判定 (Active -> Sedate -> Anaesthesia)
+        # -----------------------------------------------------------------
         cleaned_df = self.anesthesia_analyzer.evaluate_states(cleaned_df)
         cleaned_csv_path = f"{out_prefix}_cleaned.csv"
         if save_cleaned_csv:
             cleaned_df.to_csv(cleaned_csv_path, index=False)
 
-        # 阶段 6: 汇总表与科学图谱
+        # -----------------------------------------------------------------
+        # 阶段 4: 统计汇总与科学图表导出
+        # -----------------------------------------------------------------
         summary_df = self.anesthesia_analyzer.extract_summary(cleaned_df)
         summary_csv_path = f"{out_prefix}_results_summary.csv"
         summary_df.to_csv(summary_csv_path, index=False)
@@ -120,6 +143,7 @@ class DrosophilaBehaviorPipeline:
         return {
             "base_name": base_name,
             "elapsed_sec": elapsed,
+            "raw_csv_path": raw_csv_path if (is_freshly_tracked and save_raw_csv) or not is_freshly_tracked else None,
             "cleaned_df": cleaned_df,
             "summary_df": summary_df,
             "cleaned_csv_path": cleaned_csv_path if save_cleaned_csv else None,
