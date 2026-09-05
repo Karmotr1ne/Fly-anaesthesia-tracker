@@ -1388,7 +1388,7 @@ class MainWindow(QMainWindow):
 
         # 1. 速度衰减阈值比例
         h_spd = QHBoxLayout()
-        h_spd.addWidget(QLabel("Sedate Speed Ratio:"))
+        h_spd.addWidget(QLabel("Sedate Speed Dropping Ratio:"))
         self.spin_speed_ratio = QDoubleSpinBox()
         self.spin_speed_ratio.setRange(0.05, 0.90)
         self.spin_speed_ratio.setSingleStep(0.05)
@@ -1398,7 +1398,7 @@ class MainWindow(QMainWindow):
 
         # 2. 1秒单步跌落高度差阈值
         h_drop = QHBoxLayout()
-        h_drop.addWidget(QLabel("Sedate Drop Height (1s):"))
+        h_drop.addWidget(QLabel("Sedate Drop Height (percentage/1s):"))
         self.spin_drop_thresh = QDoubleSpinBox()
         self.spin_drop_thresh.setRange(0.05, 0.80)
         self.spin_drop_thresh.setSingleStep(0.05)
@@ -1408,7 +1408,7 @@ class MainWindow(QMainWindow):
 
         # 3. 麻醉持续极值静止时长
         h_still = QHBoxLayout()
-        h_still.addWidget(QLabel("Anaesthesia Window:"))
+        h_still.addWidget(QLabel("Anaesthesia Time Window:"))
         self.spin_still_sec = QSpinBox()
         self.spin_still_sec.setRange(30, 600)
         self.spin_still_sec.setSingleStep(10)
