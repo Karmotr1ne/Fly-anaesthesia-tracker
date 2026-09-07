@@ -508,17 +508,41 @@ class ChamberCalibrationDialog(QDialog):
         self.video_path = video_path
         self.sample_frame = None
         self.order = order
-        self.rows = max(1, rows)
-        self.cols = max(1, cols)
-        self.boxes = [list(b) for b in initial_chambers] if initial_chambers else []
+        self.last_first_box = None
+
+        # 优先读取已有选框
+        if initial_chambers and len(initial_chambers) > 0:
+            self.boxes = [list(b) for b in initial_chambers]
+            self.last_first_box = tuple(self.boxes[0])
+            if len(self.boxes) != (rows * cols):
+                self.rows = rows
+                self.cols = max(1, len(self.boxes) // rows)
+            else:
+                self.rows = rows
+                self.cols = cols
+        else:
+            self.boxes = []
+            self.rows = max(1, rows)
+            self.cols = max(1, cols)
+
         self._load_video_sample()
         self._setup_ui()
+
+        if self.boxes:
+            self.canvas.set_data(self.sample_frame, self.boxes, self.rows, self.cols)
+            self._rebuild_chamber_buttons()
+            self.tip_label.setText(f"<b>Loaded {len(self.boxes)} calibrated chambers</b>.")
+        else:
+            self.canvas.set_data(self.sample_frame, [], self.rows, self.cols)
+            self.canvas.start_redraw_first_roi()
 
     def _load_video_sample(self):
         try:
             cap = cv2.VideoCapture(self.video_path)
             if cap.isOpened():
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 30)
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                sample_idx = min(30, max(0, total_frames // 10))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, sample_idx)
                 ret, frame = cap.read()
                 if ret and frame is not None:
                     self.sample_frame = frame
@@ -530,20 +554,210 @@ class ChamberCalibrationDialog(QDialog):
 
     def _setup_ui(self):
         main_layout = QHBoxLayout(self)
-        self.canvas = InteractiveChamberCanvas()
-        self.canvas.set_data(self.sample_frame, self.boxes, self.rows, self.cols)
-        main_layout.addWidget(self.canvas, 7)
+        main_layout.setContentsMargins(14, 14, 14, 14)
+        main_layout.setSpacing(14)
 
-        right_box = QVBoxLayout()
-        btn_ok = QPushButton("Save & Apply Calibration")
-        btn_ok.setStyleSheet("background-color: #16A34A; color: white; font-weight: bold; padding: 10px;")
-        btn_ok.clicked.connect(self.accept)
+        # 左侧：交互式画布与提示区
+        left_layout = QVBoxLayout()
+        self.canvas = InteractiveChamberCanvas()
+        self.canvas.firstRoiDrawn.connect(self._on_first_roi_drawn)
+        self.canvas.boxChanged.connect(self._on_canvas_box_changed)
+        self.canvas.selectionChanged.connect(self._on_selection_changed)
+        left_layout.addWidget(self.canvas, 1)
+
+        self.tip_label = QLabel(f"<b>Draw the first tube (CH 1) in top-left</b>: System infers {self.rows}x{self.cols} grid. Press Ctrl+Z to undo.")
+        self.tip_label.setStyleSheet("color: #E2E8F0; font-size: 13px; background-color: #1E293B; padding: 8px; border-radius: 6px;")
+        left_layout.addWidget(self.tip_label)
+
+        # 右侧：控制面板
+        right_layout = QVBoxLayout()
+        right_layout.setSpacing(10)
+
+        # 1. 规格设置 (行列数与排序方式)
+        grp_grid = QGroupBox("1. Grid Geometry")
+        v_grid = QVBoxLayout()
+        
+        h_dim = QHBoxLayout()
+        h_dim.addWidget(QLabel("Rows:"))
+        self.spin_rows = QSpinBox()
+        self.spin_rows.setRange(1, 32)
+        self.spin_rows.setValue(self.rows)
+        self.spin_rows.valueChanged.connect(self._on_grid_dims_changed)
+        h_dim.addWidget(self.spin_rows)
+
+        h_dim.addWidget(QLabel("Cols:"))
+        self.spin_cols = QSpinBox()
+        self.spin_cols.setRange(1, 16)
+        self.spin_cols.setValue(self.cols)
+        self.spin_cols.valueChanged.connect(self._on_grid_dims_changed)
+        h_dim.addWidget(self.spin_cols)
+        v_grid.addLayout(h_dim)
+
+        h_ord = QHBoxLayout()
+        h_ord.addWidget(QLabel("Chamber Order:"))
+        self.combo_ord = QComboBox()
+        self.combo_ord.addItems(["Column-first (1..N)", "Row-first (1..N)"])
+        self.combo_ord.setCurrentIndex(0 if self.order == "column_first" else 1)
+        self.combo_ord.currentIndexChanged.connect(self._on_grid_dims_changed)
+        h_ord.addWidget(self.combo_ord)
+        v_grid.addLayout(h_ord)
+
+        btn_redraw = QPushButton("Redraw First Tube ROI (CH 1)")
+        btn_redraw.setStyleSheet("background-color: #0284C7; color: white; font-weight: bold; padding: 7px; border-radius: 4px;")
+        btn_redraw.clicked.connect(self._on_click_redraw)
+        v_grid.addWidget(btn_redraw)
+
+        grp_grid.setLayout(v_grid)
+        right_layout.addWidget(grp_grid)
+
+        # 2. 交互模式选择
+        grp_mode = QGroupBox("2. Drag & Resize Link Mode")
+        v_mode = QVBoxLayout()
+        self.rb_single = QRadioButton("Single Active Chamber (Default)")
+        self.rb_all = QRadioButton("Move All Selected Chambers")
+        self.rb_col = QRadioButton("Active Column Linked (Column)")
+        self.rb_row = QRadioButton("Active Row Linked (Row)")
+        self.rb_single.setChecked(True)
+
+        self.rb_single.toggled.connect(lambda: self._set_mode("single"))
+        self.rb_all.toggled.connect(lambda: self._set_mode("all"))
+        self.rb_col.toggled.connect(lambda: self._set_mode("col"))
+        self.rb_row.toggled.connect(lambda: self._set_mode("row"))
+
+        v_mode.addWidget(self.rb_single)
+        v_mode.addWidget(self.rb_all)
+        v_mode.addWidget(self.rb_col)
+        v_mode.addWidget(self.rb_row)
+        grp_mode.setLayout(v_mode)
+        right_layout.addWidget(grp_mode)
+
+        # 3. 辅助对齐与历史工具
+        grp_tools = QGroupBox("3. Visual Tools & History")
+        v_tools = QVBoxLayout()
+        
+        btn_undo = QPushButton("Undo Last Action (Ctrl+Z)")
+        btn_undo.setStyleSheet("background-color: #475569; color: white; font-weight: bold; padding: 6px; border-radius: 4px;")
+        btn_undo.clicked.connect(self.canvas.undo)
+        v_tools.addWidget(btn_undo)
+
+        btn_snap = QPushButton("Auto-Snap Tube Boundaries")
+        btn_snap.setStyleSheet("background-color: #334155; color: white; padding: 6px; border-radius: 5px;")
+        btn_snap.clicked.connect(self._on_auto_snap)
+        v_tools.addWidget(btn_snap)
+
+        grp_tools.setLayout(v_tools)
+        right_layout.addWidget(grp_tools)
+
+        # 4. 小室快捷跳转选择器
+        grp_sel = QGroupBox("4. Active Chamber (1..N)")
+        v_sel = QVBoxLayout()
+        self.scroll_ch = QScrollArea()
+        self.scroll_ch.setFixedHeight(70)
+        self.scroll_ch.setWidgetResizable(True)
+        self.scroll_widget = QWidget()
+        self.grid_ch = QHBoxLayout(self.scroll_widget)
+        self.grid_ch.setContentsMargins(4, 4, 4, 4)
+        self.grid_ch.setSpacing(4)
+        self.scroll_ch.setWidget(self.scroll_widget)
+        v_sel.addWidget(self.scroll_ch)
+        grp_sel.setLayout(v_sel)
+        right_layout.addWidget(grp_sel)
+
+        right_layout.addStretch()
+
+        # 底部确定与取消
+        h_btn = QHBoxLayout()
         btn_cancel = QPushButton("Cancel")
         btn_cancel.clicked.connect(self.reject)
-        right_box.addStretch()
-        right_box.addWidget(btn_ok)
-        right_box.addWidget(btn_cancel)
-        main_layout.addLayout(right_box, 3)
+        btn_ok = QPushButton("Save & Apply Calibration")
+        btn_ok.setStyleSheet("background-color: #16A34A; color: white; font-weight: bold; padding: 10px 18px; border-radius: 6px;")
+        btn_ok.clicked.connect(self.accept)
+        h_btn.addWidget(btn_cancel)
+        h_btn.addWidget(btn_ok)
+        right_layout.addLayout(h_btn)
+
+        main_layout.addLayout(left_layout, 7)
+        main_layout.addLayout(right_layout, 3)
+
+    def _on_selection_changed(self, count: int):
+        multi = (count > 1)
+        self.rb_col.setEnabled(not multi)
+        self.rb_row.setEnabled(not multi)
+        if multi and (self.rb_col.isChecked() or self.rb_row.isChecked()):
+            self.rb_all.setChecked(True)
+            self.canvas.link_mode = "all"
+
+    def _on_auto_snap(self):
+        if self.sample_frame is None or not self.canvas.boxes:
+            return
+        base_boxes = [list(b) for b in self.canvas.boxes]
+        refined = RobustGridAligner.snap_all_boxes(
+            frame_bgr=self.sample_frame,
+            boxes=base_boxes,
+            rows=self.rows,
+            cols=self.cols
+        )
+        self.canvas._push_undo()
+        self.canvas.boxes = refined
+        self.canvas._update_fly_detections()
+        self.canvas.boxChanged.emit()
+        self.canvas.update()
+
+    def _on_first_roi_drawn(self, first_box: Tuple[int, int, int, int]):
+        self.last_first_box = first_box
+        self._recompute_inference()
+
+    def _on_grid_dims_changed(self):
+        self.rows = self.spin_rows.value()
+        self.cols = self.spin_cols.value()
+        self.order = "column_first" if self.combo_ord.currentIndex() == 0 else "row_first"
+        if self.last_first_box is not None:
+            self._recompute_inference()
+
+    def _recompute_inference(self):
+        if self.sample_frame is not None and self.last_first_box is not None:
+            estimated_boxes = RobustGridAligner.estimate_chambers_from_first_roi(
+                self.sample_frame,
+                self.last_first_box,
+                rows=self.rows,
+                cols=self.cols,
+                order=self.order
+            )
+            self.boxes = [list(b) for b in estimated_boxes]
+            self.canvas.set_data(self.sample_frame, self.boxes, self.rows, self.cols)
+            self._rebuild_chamber_buttons()
+            self.tip_label.setText(f"<b>Generated {len(self.boxes)} Chambers ({self.rows}x{self.cols})</b>. Drag handles to fine-tune.")
+
+    def _on_click_redraw(self):
+        self.canvas.start_redraw_first_roi()
+        self.tip_label.setText("<b>Draw the first tube (CH 1) in top-left</b>...")
+
+    def _rebuild_chamber_buttons(self):
+        while self.grid_ch.count():
+            item = self.grid_ch.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for i in range(len(self.canvas.boxes)):
+            cid = i + 1
+            b = QPushButton(f"{cid}")
+            b.setFixedWidth(34)
+            b.setStyleSheet("font-weight: bold; background-color: #1E293B; color: #F8FAFC;")
+            b.clicked.connect(lambda checked, idx=i: self._select_chamber(idx))
+            self.grid_ch.addWidget(b)
+
+    def _select_chamber(self, idx: int):
+        self.canvas.selected_idx = max(0, min(len(self.canvas.boxes) - 1, idx))
+        self.canvas.selected_indices = {self.canvas.selected_idx}
+        self.canvas.selectionChanged.emit(1)
+        self.canvas.update()
+
+    def _on_canvas_box_changed(self):
+        self.boxes = self.canvas.boxes
+        if len(self.boxes) > 0:
+            self.last_first_box = tuple(self.boxes[0])
+
+    def _set_mode(self, mode: str):
+        self.canvas.link_mode = mode
 
     def get_chambers(self) -> List[Tuple[int, int, int, int]]:
         return [tuple(b) for b in self.canvas.boxes]
