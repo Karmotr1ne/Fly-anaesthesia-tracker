@@ -2,129 +2,228 @@
 Module 4: Anesthesia & Sedation Kinetics Analyzer
 =================================================
 Quantifies drug/anesthetic behavioral kinetics (latency to sedation/knockdown,
-inactivity onset, baseline locomotion) using sliding window max filter operators.
+inactivity onset, baseline locomotion, drop events) using sliding window operators
+and 3-stage state machine constrained by gas onset.
 """
 
 import os
-from typing import Optional, Dict, Any, List, Tuple, Union
+from typing import Optional, Dict, Any, List, Tuple
 import numpy as np
 import pandas as pd
-from .stationary_engine import StationaryDetectionEngine
-from .models import PipelineConfig, AnesthesiaSummary
 
 
 class AnesthesiaAnalyzer:
-    """
-    Analyzes behavioral knockdown dynamics, induction time points, and sedation kinetics.
-    """
-
     def __init__(
         self,
-        bin_size_sec: float = 5.0,
-        window_duration_sec: float = 120.0,
-        window_bins: Optional[int] = None,
-        activity_threshold: float = 0.01,
         fps: float = 30.0,
+        anesthesia_still_sec: float = 120.0,
+        anesthesia_speed_thresh: float = 0.5,
+        baseline_quantile: float = 0.75,
+        drop_dt_sec: float = 0.35,
+        drop_height_delta: float = 0.30,
+        drop_top_thresh: float = 0.45,
+        drop_bottom_thresh: float = 0.20,
+        drop_sustain_sec: float = 4.0,
+        bottom_quiescent_sec: float = 10.0,
+        anesthesia_onset_time: float = 0.0,
+        **kwargs
     ):
-        self.bin_size_sec = bin_size_sec
-        self.window_duration_sec = window_duration_sec
-        if window_bins is not None:
-            self.window_bins = window_bins
-        else:
-            self.window_bins = max(1, int(round(window_duration_sec / bin_size_sec)))
-        self.activity_threshold = activity_threshold
-        self.fps = fps
+        self.fps = float(fps)
+        self.anesthesia_still_sec = float(anesthesia_still_sec)
+        self.anesthesia_speed_thresh = float(anesthesia_speed_thresh)
+        self.baseline_quantile = float(baseline_quantile)
+        self.drop_dt_sec = float(drop_dt_sec)
+        self.drop_height_delta = float(drop_height_delta)
+        self.drop_top_thresh = float(drop_top_thresh)
+        self.drop_bottom_thresh = float(drop_bottom_thresh)
+        self.drop_sustain_sec = float(drop_sustain_sec)
+        self.bottom_quiescent_sec = float(bottom_quiescent_sec)
+        self.anesthesia_onset_time = float(anesthesia_onset_time)
 
-    def evaluate_induction(
+    def evaluate_states(
         self,
         cleaned_df: pd.DataFrame,
-        fps: Optional[float] = None
+        anesthesia_onset_time: Optional[float] = None
     ) -> pd.DataFrame:
-        """
-        Calculates time to sedation per chamber.
+        if cleaned_df is None or cleaned_df.empty:
+            return pd.DataFrame()
 
-        Parameters
-        ----------
-        cleaned_df : pd.DataFrame
-            DataFrame containing columns: ['frame', 'chamber_id', 'speed'] (and optionally 'timestamp_s')
-        fps : float, optional
-            Video acquisition frame rate (defaults to instance fps).
+        gas_onset = float(anesthesia_onset_time if anesthesia_onset_time is not None else self.anesthesia_onset_time)
 
-        Returns
-        -------
-        pd.DataFrame
-            Summary dataframe with columns:
-            ['chamber_id', 'induction_time_sec', 'is_sedated', 'baseline_speed', 'pre_sedation_activity', 'stillness_bins_count']
-        """
-        if cleaned_df.empty:
-            return pd.DataFrame(columns=[
-                "chamber_id", "induction_time_sec", "is_sedated", "baseline_speed", "pre_sedation_activity", "stillness_bins_count"
-            ])
+        still_win_frames = max(1, int(round(self.anesthesia_still_sec * self.fps)))
+        drop_dt_frames = max(1, int(round(self.drop_dt_sec * self.fps)))
+        drop_sustain_frames = max(1, int(round(self.drop_sustain_sec * self.fps)))
+        min_observe_frames = max(1, drop_sustain_frames // 2)
+        bottom_quiescent_frames = max(1, int(round(self.bottom_quiescent_sec * self.fps)))
+        smooth_frames = max(1, int(round(2.0 * self.fps)))
 
-        effective_fps = fps or self.fps
-        frames_per_bin = max(1, int(round(self.bin_size_sec * effective_fps)))
-        results = []
+        result_dfs = []
 
-        for cid, group in cleaned_df.groupby("chamber_id"):
-            grp = group.sort_values("frame").reset_index(drop=True)
-            speeds = grp["speed"].fillna(0.0).to_numpy()
-            total_frames = len(speeds)
+        for cid, grp in cleaned_df.groupby("chamber_id"):
+            g = grp.copy().sort_values("frame").reset_index(drop=True)
+            n = len(g)
 
-            if total_frames == 0:
-                continue
-
-            # 1. Temporal Binning of Mean Speed/Activity (5s bins)
-            num_bins = int(np.ceil(total_frames / frames_per_bin))
-            binned_activity = np.zeros(num_bins, dtype=np.float64)
-            time_axis_sec = np.arange(num_bins) * self.bin_size_sec
-
-            for b in range(num_bins):
-                start_f = b * frames_per_bin
-                end_f = min(total_frames, (b + 1) * frames_per_bin)
-                binned_activity[b] = np.mean(speeds[start_f:end_f])
-
-            # Baseline speed (first 10% of recording or initial 60 seconds)
-            init_bins = max(1, min(12, int(num_bins * 0.1)))
-            baseline_speed = float(np.mean(binned_activity[:init_bins]))
-
-            # Count bins below activity threshold
-            stillness_bins_count = int(np.sum(binned_activity < self.activity_threshold))
-
-            # 2. Sliding Window Max Inactivity Detection Engine (W = 120s, 24 bins)
-            stationary_mask = StationaryDetectionEngine.sliding_window_max_filter(
-                activity_series=binned_activity,
-                window_size=self.window_bins,
-                threshold=self.activity_threshold
-            )
-
-            # 3. Extraction of First True Inactivity Onset
-            induction_time_sec = None
-            is_sedated = False
-            pre_sedation_activity = 0.0
-
-            true_indices = np.where(stationary_mask)[0]
-            if len(true_indices) > 0:
-                first_onset_bin = true_indices[0]
-                induction_time_sec = round(float(time_axis_sec[first_onset_bin]), 2)
-                is_sedated = True
-
-                # Compute average activity prior to sedation onset
-                if first_onset_bin > 0:
-                    pre_sedation_activity = float(np.mean(binned_activity[:first_onset_bin]))
-                else:
-                    pre_sedation_activity = float(binned_activity[0])
+            # 1. 时间戳与动力学列读取
+            if "timestamp_s" in g.columns:
+                timestamps = g["timestamp_s"].to_numpy()
+            elif "timestamp" in g.columns:
+                timestamps = g["timestamp"].to_numpy()
             else:
-                # Animal did not reach full sustained sedation
-                pre_sedation_activity = float(np.mean(binned_activity))
+                timestamps = g["frame"].to_numpy() / self.fps
+                g["timestamp_s"] = timestamps
 
-            results.append({
+            speeds = g["speed"].to_numpy() if "speed" in g.columns else np.zeros(n)
+            
+            if "norm_height" in g.columns:
+                heights = g["norm_height"].to_numpy()
+            elif "norm_pos" in g.columns:
+                heights = g["norm_pos"].to_numpy()
+            else:
+                heights = np.zeros(n)
+
+            # 2. 划分给药前（基线期）与给药后阶段
+            post_gas_mask = timestamps >= gas_onset
+            pre_gas_mask = ~post_gas_mask
+
+            # 3. 基线速度计算（保留完整停顿与微动）
+            pre_gas_speeds = speeds[pre_gas_mask]
+            if len(pre_gas_speeds) >= int(self.fps):
+                baseline_speed = float(np.percentile(pre_gas_speeds, self.baseline_quantile * 100))
+            else:
+                baseline_speed = 15.0
+
+            # 4. 深度麻醉判定 (Anaesthesia) - 仅在 post_gas 序列中滑动
+            is_anaesthesia = np.zeros(n, dtype=bool)
+            post_indices = np.where(post_gas_mask)[0]
+
+            if len(post_indices) >= still_win_frames:
+                post_speeds = speeds[post_indices]
+                post_still = post_speeds < self.anesthesia_speed_thresh
+                post_rolling_still = (
+                    pd.Series(post_still)
+                    .rolling(window=still_win_frames, min_periods=still_win_frames)
+                    .sum() == still_win_frames
+                ).to_numpy()
+
+                still_ends = np.where(post_rolling_still)[0]
+                if len(still_ends) > 0:
+                    first_still_end = still_ends[0]
+                    first_ana_idx = post_indices[first_still_end - still_win_frames + 1]
+                    is_anaesthesia[first_ana_idx:] = True
+
+            # 5. 镇静判定 (Sedate / Knockdown)
+            is_sedate = np.zeros(n, dtype=bool)
+            is_drop_event = np.zeros(n, dtype=bool)
+            first_sedate_idx = None
+
+            # 路径 A: 失控跌落检测
+            for i in range(drop_dt_frames, n):
+                if not post_gas_mask[i]:
+                    continue
+
+                h_start = heights[i - drop_dt_frames]
+                h_end = heights[i]
+                dh = h_start - h_end
+
+                if (h_start > self.drop_top_thresh) and (h_end < self.drop_bottom_thresh) and (dh > self.drop_height_delta):
+                    is_drop_event[i] = True
+
+                    if first_sedate_idx is None:
+                        eval_end = min(n, i + drop_sustain_frames)
+                        post_drop_heights = heights[i:eval_end]
+                        # 确保满足有效观察时间且未复爬回高处
+                        if len(post_drop_heights) >= min(min_observe_frames, n - i) and np.all(post_drop_heights < (self.drop_top_thresh * 0.8)):
+                            first_sedate_idx = i
+
+            # 路径 B: 底部持续静息兜底
+            if first_sedate_idx is None and len(post_indices) >= bottom_quiescent_frames:
+                rolling_speed = (
+                    pd.Series(speeds)
+                    .rolling(smooth_frames, center=True, min_periods=1)
+                    .mean()
+                    .to_numpy()
+                )
+                quiescent_at_bottom = (
+                    post_gas_mask
+                    & (heights < self.drop_bottom_thresh)
+                    & (rolling_speed <= max(self.anesthesia_speed_thresh, baseline_speed))
+                )
+                rolling_quiescent = (
+                    pd.Series(quiescent_at_bottom[post_indices])
+                    .rolling(window=bottom_quiescent_frames, min_periods=bottom_quiescent_frames)
+                    .sum() == bottom_quiescent_frames
+                ).to_numpy()
+
+                q_ends = np.where(rolling_quiescent)[0]
+                if len(q_ends) > 0:
+                    first_sedate_idx = post_indices[q_ends[0] - bottom_quiescent_frames + 1]
+
+            if first_sedate_idx is not None:
+                is_sedate[first_sedate_idx:] = True
+
+            # 6. 状态合并赋值
+            states = np.full(n, "Active", dtype=object)
+            states[is_sedate & (~is_anaesthesia)] = "Sedate"
+            states[is_anaesthesia] = "Anaesthesia"
+
+            g["state"] = states
+            g["is_drop_event"] = is_drop_event.astype(int)
+            g["baseline_speed"] = round(baseline_speed, 2)
+            g["norm_height"] = heights
+            g["norm_pos"] = heights
+
+            result_dfs.append(g)
+
+        return pd.concat(result_dfs, ignore_index=True) if result_dfs else pd.DataFrame()
+
+    def extract_summary(
+        self,
+        df_with_states: pd.DataFrame,
+        anesthesia_onset_time: Optional[float] = None
+    ) -> pd.DataFrame:
+        if df_with_states is None or df_with_states.empty:
+            return pd.DataFrame()
+
+        gas_onset = float(anesthesia_onset_time if anesthesia_onset_time is not None else self.anesthesia_onset_time)
+        summaries = []
+
+        for cid, grp in df_with_states.groupby("chamber_id"):
+            g = grp.sort_values("frame").reset_index(drop=True)
+            time_col = "timestamp_s" if "timestamp_s" in g.columns else ("timestamp" if "timestamp" in g.columns else "frame")
+            if time_col == "frame":
+                g["timestamp_s"] = g["frame"] / self.fps
+                time_col = "timestamp_s"
+
+            post_gas_df = g[g[time_col] >= gas_onset]
+
+            ana_rows = post_gas_df[post_gas_df["state"] == "Anaesthesia"]
+            first_ana_time = ana_rows[time_col].iloc[0] if not ana_rows.empty else None
+
+            sed_rows = post_gas_df[post_gas_df["state"] == "Sedate"]
+            first_sed_time = sed_rows[time_col].iloc[0] if not sed_rows.empty else None
+
+            if first_sed_time is None and first_ana_time is not None:
+                first_sed_time = first_ana_time
+            elif first_sed_time is not None and first_ana_time is not None:
+                first_sed_time = min(first_sed_time, first_ana_time)
+
+            baseline_spd = g["baseline_speed"].iloc[0] if "baseline_speed" in g.columns else 0.0
+            total_drops = int(post_gas_df["is_drop_event"].sum()) if "is_drop_event" in post_gas_df.columns else 0
+
+            sed_latency = round(first_sed_time - gas_onset, 2) if first_sed_time is not None else None
+            ana_latency = round(first_ana_time - gas_onset, 2) if first_ana_time is not None else None
+
+            summaries.append({
                 "chamber_id": int(cid),
-                "induction_time_sec": induction_time_sec,
-                "is_sedated": is_sedated,
-                "baseline_speed": round(baseline_speed, 2),
-                "pre_sedation_activity": round(pre_sedation_activity, 2),
-                "stillness_bins_count": stillness_bins_count,
+                "anesthesia_gas_onset_sec": gas_onset,
+                "sedation_onset_sec": round(first_sed_time, 2) if first_sed_time is not None else None,
+                "anesthesia_onset_sec": round(first_ana_time, 2) if first_ana_time is not None else None,
+                "sedation_latency_sec": sed_latency,
+                "anesthesia_latency_sec": ana_latency,
+                "is_sedated": first_sed_time is not None,
+                "is_anesthetized": first_ana_time is not None,
+                "total_drop_events": total_drops,
+                "baseline_speed": float(baseline_spd),
             })
 
-        summary_df = pd.DataFrame(results)
-        return summary_df
+        return pd.DataFrame(summaries)

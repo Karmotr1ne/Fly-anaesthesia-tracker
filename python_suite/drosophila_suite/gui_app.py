@@ -823,7 +823,7 @@ class ChamberCalibrationDialog(QDialog):
         right_layout.addWidget(grp_grid)
 
         # 2. Link Mode (重命名 "All" -> "移动所有选中", 默认 "Single")
-        grp_mode = QGroupBox("2. Drag & Resize Link Mode")
+        grp_mode = QGroupBox("2. Drag and Resize Link Mode")
         v_mode = QVBoxLayout()
         self.rb_single = QRadioButton("Single Active Chamber (Default)")
         self.rb_all = QRadioButton("Move All Selected Chambers")
@@ -844,7 +844,7 @@ class ChamberCalibrationDialog(QDialog):
         right_layout.addWidget(grp_mode)
 
         # 3. Vision Tools, Auto-Snap & Undo
-        grp_tools = QGroupBox("3. Visual Tools & History")
+        grp_tools = QGroupBox("3. Visual Tools and History")
         v_tools = QVBoxLayout()
         
         btn_undo = QPushButton("Undo Last Action")
@@ -885,7 +885,7 @@ class ChamberCalibrationDialog(QDialog):
         h_btn = QHBoxLayout()
         btn_cancel = QPushButton("Cancel")
         btn_cancel.clicked.connect(self.reject)
-        btn_ok = QPushButton("Save & Apply Calibration")
+        btn_ok = QPushButton("Save and Apply Calibration")
         btn_ok.setStyleSheet("background-color: #16A34A; color: white; font-weight: bold; padding: 10px 18px; border-radius: 6px;")
         btn_ok.clicked.connect(self.accept)
         h_btn.addWidget(btn_cancel)
@@ -1022,7 +1022,7 @@ class DragDropArea(QFrame):
             }
         """)
         layout = QVBoxLayout()
-        self.label = QLabel("Drag & Drop CSV or Video files here\n(or click to browse)")
+        self.label = QLabel("Drag and Drop CSV or Video files here\n(or click to browse)")
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.label.setStyleSheet("color: #455A64; font-size: 14px; font-weight: 500;")
         layout.addWidget(self.label)
@@ -1034,7 +1034,7 @@ class DragDropArea(QFrame):
             self,
             "Select Experiment Files",
             "",
-            "Experiment Data & Videos (*.csv *.mp4 *.avi *.mov *.mkv);;All Files (*.*)"
+            "Experiment Data or Videos (*.csv *.mp4 *.avi *.mov *.mkv);;All Files (*.*)"
         )
         if files:
             for f in files:
@@ -1168,6 +1168,9 @@ class TrackingOnlyWorker(QRunnable):
         self.signals.finished.emit(all_results)
 
 
+# =====================================================================
+# PipelineBatchWorker (完整替换)
+# =====================================================================
 class PipelineBatchWorker(QRunnable):
     """
     Worker for end-to-end full pipeline execution (Modules 1 to 5).
@@ -1176,6 +1179,8 @@ class PipelineBatchWorker(QRunnable):
         self,
         matched_pairs: Dict[str, dict],
         config: PipelineConfig,
+        anesthesia_onset_time: float = 0.0,
+        save_raw_csv: bool = True,
         save_cleaned_csv: bool = True,
         generate_plots: bool = True,
         render_video_overlay: bool = False,
@@ -1183,6 +1188,8 @@ class PipelineBatchWorker(QRunnable):
         super().__init__()
         self.matched_pairs = matched_pairs
         self.config = config
+        self.anesthesia_onset_time = anesthesia_onset_time
+        self.save_raw_csv = save_raw_csv
         self.save_cleaned_csv = save_cleaned_csv
         self.generate_plots = generate_plots
         self.render_video_overlay = render_video_overlay
@@ -1230,7 +1237,7 @@ class PipelineBatchWorker(QRunnable):
                         ch_rois = [c["roi"] for c in chamber_configs]
 
                 def on_tracking_progress(f_cur, f_tot):
-                    if f_tot > 0:
+                    if f_tot > 0 and (f_cur % 15 == 0 or f_cur == f_tot):
                         pct = int((f_cur / f_tot) * 100)
                         self.signals.progress.emit(
                             processed,
@@ -1239,7 +1246,7 @@ class PipelineBatchWorker(QRunnable):
                         )
 
                 def on_rendering_progress(f_cur, f_tot):
-                    if f_tot > 0:
+                    if f_tot > 0 and (f_cur % 10 == 0 or f_cur == f_tot):
                         pct = int((f_cur / f_tot) * 100)
                         self.signals.progress.emit(
                             processed,
@@ -1252,6 +1259,8 @@ class PipelineBatchWorker(QRunnable):
                     video_path=paths.get("video"),
                     base_name=base,
                     chamber_rois=ch_rois,
+                    anesthesia_onset_time=self.anesthesia_onset_time,
+                    save_raw_csv=self.save_raw_csv,
                     save_cleaned_csv=self.save_cleaned_csv,
                     generate_plots=self.generate_plots,
                     render_video_overlay=self.render_video_overlay,
@@ -1280,7 +1289,7 @@ class PipelineBatchWorker(QRunnable):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Drosophila Anesthesia Tracker & Multi-Chamber Workstation (v0.1)")
+        self.setWindowTitle("Drosophila Anesthesia Tracker (FATer-v0.1)")
         self.resize(1180, 820)
         self.matched_pairs = {}
         self.config = PipelineConfig()
@@ -1306,7 +1315,7 @@ class MainWindow(QMainWindow):
         self.drop_area.filesChanged.connect(self.on_files_updated)
         left_layout.addWidget(self.drop_area)
 
-        header_pairs = QLabel("<b>2. Experiment Sessions & Pairing Status</b>")
+        header_pairs = QLabel("<b>2. Experiment Sessions and Pairing Status</b>")
         left_layout.addWidget(header_pairs)
 
         self.pair_list = QListWidget()
@@ -1348,7 +1357,7 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout()
         right_layout.setSpacing(10)
 
-        header_tasks = QLabel("<b>3. Modules & Analysis Settings</b>")
+        header_tasks = QLabel("<b>3. Modules and Analysis Settings</b>")
         right_layout.addWidget(header_tasks)
 
         # Grid Geometry
@@ -1387,7 +1396,7 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(grp_track)
 
         # Module 2: Kinematic Cleaning
-        grp_a = QGroupBox("Module 2: Kinematic Cleaning & Artifact Clamping")
+        grp_a = QGroupBox("Module 2: Kinematic Cleaning and Artifact Denoising")
         vbox_a = QVBoxLayout()
         self.cb_save_clean = QCheckBox("Export Cleaned Location Data (*_cleaned.csv)")
         self.cb_save_clean.setChecked(True)
@@ -1395,51 +1404,90 @@ class MainWindow(QMainWindow):
         grp_a.setLayout(vbox_a)
         right_layout.addWidget(grp_a)
 
-        # Module 4: Anesthesia Kinetics
-        grp_b = QGroupBox("Module 4: State Kinetics")
+        # Module 3: Kinetics & Gas Delivery Onset
+        grp_b = QGroupBox("Module 3:Gas Delivery Onset and Kinetics Thresholds")
         vbox_b = QVBoxLayout()
-        vbox_b.setSpacing(8)
+        vbox_b.setSpacing(6)
 
-        self.cb_anesthesia = QCheckBox("Knockdown Latency & Recovery Time Analysis (*_anesthesia.csv)")
-        self.cb_anesthesia.setChecked(True)
-        vbox_b.addWidget(self.cb_anesthesia)
+        # 1. Anesthesia Gas Onset Time
+        h_gas = QHBoxLayout()
+        lbl_gas = QLabel("<b>Anesthesia Gas Onset Time:</b>")
+        lbl_gas.setStyleSheet("color: #F59E0B; font-weight: bold;")
+        self.spin_gas_onset = QDoubleSpinBox()
+        self.spin_gas_onset.setRange(0.0, 7200.0)
+        self.spin_gas_onset.setSingleStep(5.0)
+        self.spin_gas_onset.setValue(0.0)
+        self.spin_gas_onset.setSuffix(" s")
+        h_gas.addWidget(lbl_gas)
+        h_gas.addWidget(self.spin_gas_onset)
+        vbox_b.addLayout(h_gas)
 
-        # 动态自定义时长选框布局
-        h_duration = QHBoxLayout()
-        lbl_duration = QLabel("Sedation Window (s):")
-        
-        self.spin_window_sec = QSpinBox()
-        self.spin_window_sec.setRange(120, 300)       # 2 到 5 分钟 (120s ~ 300s)
-        self.spin_window_sec.setSingleStep(5)        # 每次步进 5 秒（对应 1 个 bin）
-        self.spin_window_sec.setValue(120)           # 默认 120 秒
-        self.spin_window_sec.setSuffix(" s")
-        
-        # 实时显示对应分钟与 bin 数量
-        self.lbl_window_info = QLabel("(2.0 min, 24 bins)")
-        self.lbl_window_info.setStyleSheet("color: #64748B; font-size: 11px;")
-        
-        # 绑定值变化事件
-        self.spin_window_sec.valueChanged.connect(self._on_anesthesia_duration_changed)
+        # 2. Sedate Speed Ratio (速度阈值 1)
+        h_ratio = QHBoxLayout()
+        lbl_ratio = QLabel("Sedate Speed Ratio:")
+        self.spin_speed_ratio = QDoubleSpinBox()
+        self.spin_speed_ratio.setRange(0.05, 1.0)
+        self.spin_speed_ratio.setSingleStep(0.05)
+        self.spin_speed_ratio.setValue(0.35)
+        h_ratio.addWidget(lbl_ratio)
+        h_ratio.addWidget(self.spin_speed_ratio)
+        vbox_b.addLayout(h_ratio)
 
-        h_duration.addWidget(lbl_duration)
-        h_duration.addWidget(self.spin_window_sec)
-        h_duration.addWidget(self.lbl_window_info)
-        h_duration.addStretch()
+        # 3. Sedate Drop Height (/1s) (掉落阈值窗口)
+        h_drop = QHBoxLayout()
+        lbl_drop = QLabel("Sedate Drop Height (/1s):")
+        self.spin_drop_thresh = QDoubleSpinBox()
+        self.spin_drop_thresh.setRange(0.05, 0.95)
+        self.spin_drop_thresh.setSingleStep(0.05)
+        self.spin_drop_thresh.setValue(0.25)
+        h_drop.addWidget(lbl_drop)
+        h_drop.addWidget(self.spin_drop_thresh)
+        vbox_b.addLayout(h_drop)
 
-        vbox_b.addLayout(h_duration)
+        # 4. Anaesthesia Still Window
+        h_still = QHBoxLayout()
+        lbl_still = QLabel("Anaesthesia Still Window:")
+        self.spin_still_sec = QSpinBox()
+        self.spin_still_sec.setRange(10, 1200)
+        self.spin_still_sec.setSingleStep(10)
+        self.spin_still_sec.setValue(120)
+        self.spin_still_sec.setSuffix(" s")
+        h_still.addWidget(lbl_still)
+        h_still.addWidget(self.spin_still_sec)
+        vbox_b.addLayout(h_still)
+
+        # 5. Anaesthesia Speed Thresh (速度阈值 2)
+        h_speed_thresh = QHBoxLayout()
+        lbl_speed_thresh = QLabel("Anaesthesia Speed Thresh:")
+        self.spin_speed_thresh = QDoubleSpinBox()
+        self.spin_speed_thresh.setRange(0.01, 20.0)
+        self.spin_speed_thresh.setSingleStep(0.05)
+        self.spin_speed_thresh.setValue(0.10)
+        self.spin_speed_thresh.setSuffix(" px/s")
+        h_speed_thresh.addWidget(lbl_speed_thresh)
+        h_speed_thresh.addWidget(self.spin_speed_thresh)
+        vbox_b.addLayout(h_speed_thresh)
+
         grp_b.setLayout(vbox_b)
         right_layout.addWidget(grp_b)
 
-        # Module 5: Scientific Visualizer
-        grp_c = QGroupBox("Module 5: Scientific Graphics & Video Synthesis")
+        # Module 4: Scientific Visualizer
+        grp_c = QGroupBox("Module 4: Scientific Graphics & Video Synthesis")
         vbox_c = QVBoxLayout()
         self.cb_plot_act_pos = QCheckBox("Dual Y-Axis Behavioral Overview (*_activity_position.png)")
         self.cb_plot_act_pos.setChecked(True)
         self.cb_plot_kymo = QCheckBox("Normalized Space-Time Kymograph (*_kymograph_norm.png)")
         self.cb_plot_kymo.setChecked(True)
+        
+        # 新增：生存阶梯图复选框
+        self.cb_plot_survival = QCheckBox("Cumulative Survival/Knockdown Curves (*_survival_kinetics.png)")
+        self.cb_plot_survival.setChecked(True)
+        
         self.cb_video_overlay = QCheckBox("Render Annotated Video Overlay (*_overlay.mp4)")
+        
         vbox_c.addWidget(self.cb_plot_act_pos)
         vbox_c.addWidget(self.cb_plot_kymo)
+        vbox_c.addWidget(self.cb_plot_survival)
         vbox_c.addWidget(self.cb_video_overlay)
         grp_c.setLayout(vbox_c)
         right_layout.addWidget(grp_c)
@@ -1508,21 +1556,31 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(right_layout, 4)
 
     def sync_config_to_ui(self):
-        self.spin_rows.setValue(self.config.grid_rows)
-        self.spin_cols.setValue(self.config.grid_cols)
-        order_idx = 0 if self.config.grid_order == "column_first" else 1
+        # 几何网格参数
+        self.spin_rows.setValue(getattr(self.config, "grid_rows", 4))
+        self.spin_cols.setValue(getattr(self.config, "grid_cols", 2))
+        order_idx = 0 if getattr(self.config, "grid_order", "column_first") == "column_first" else 1
         self.combo_order.setCurrentIndex(order_idx)
-        duration = getattr(self.config, "anesthesia_window_duration_sec", 120.0)
-        self.spin_window_sec.setValue(int(duration))
-        self._on_anesthesia_duration_changed(int(duration))
+
+        # 动力学与麻醉判定 5 参数完整加载
+        self.spin_gas_onset.setValue(float(getattr(self.config, "anesthesia_onset_time", 0.0)))
+        self.spin_speed_ratio.setValue(float(getattr(self.config, "sedate_speed_ratio", 0.35)))
+        self.spin_drop_thresh.setValue(float(getattr(self.config, "sedate_drop_speed", 0.25)))
+        self.spin_still_sec.setValue(int(getattr(self.config, "anesthesia_still_sec", 120.0)))
+        self.spin_speed_thresh.setValue(float(getattr(self.config, "anesthesia_speed_thresh", 0.10)))
 
     def sync_ui_to_config(self):
+        # 几何网格参数
         self.config.grid_rows = self.spin_rows.value()
         self.config.grid_cols = self.spin_cols.value()
         self.config.grid_order = "column_first" if self.combo_order.currentIndex() == 0 else "row_first"
-        val = self.spin_window_sec.value()
-        self.config.anesthesia_window_duration_sec = float(val)
-        self.config.anesthesia_window_bins = max(1, int(round(val / self.config.anesthesia_bin_size_sec)))
+
+        # 动力学与麻醉判定 5 参数完整持久化
+        self.config.anesthesia_onset_time = float(self.spin_gas_onset.value())
+        self.config.sedate_speed_ratio = float(self.spin_speed_ratio.value())
+        self.config.sedate_drop_speed = float(self.spin_drop_thresh.value())
+        self.config.anesthesia_still_sec = float(self.spin_still_sec.value())
+        self.config.anesthesia_speed_thresh = float(self.spin_speed_thresh.value())
 
     def on_files_updated(self, files):
         self.pair_list.clear()
@@ -1599,7 +1657,7 @@ class MainWindow(QMainWindow):
         self.drop_area.all_files = []
         self.pair_list.clear()
         self.matched_pairs = {}
-        self.drop_area.label.setText("Drag & Drop CSV or Video files here\n(or click to browse)")
+        self.drop_area.label.setText("Drag and Drop CSV or Video files here\n(or click to browse)")
         self.lbl_status.setText("Ready, awaiting task execution.")
 
     def _on_anesthesia_duration_changed(self, val: int):
@@ -1640,23 +1698,35 @@ class MainWindow(QMainWindow):
         if not self.matched_pairs:
             QMessageBox.warning(self, "Warning", "No sessions loaded for execution!")
             return
+
         self.sync_ui_to_config()
         self.btn_run.setEnabled(False)
         self.btn_track_only.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.lbl_status.setText("Starting asynchronous processing thread pool...")
 
+        # 聚合所有绘图复选框状态，后续增删图表仅需在元组内增减控件属性
+        plot_checkboxes = (
+            self.cb_plot_act_pos,
+            self.cb_plot_kymo,
+            getattr(self, "cb_plot_survival", None),
+        )
+        should_generate_plots = any(cb.isChecked() for cb in plot_checkboxes if cb is not None)
+
         worker = PipelineBatchWorker(
             matched_pairs=self.matched_pairs,
             config=self.config,
+            anesthesia_onset_time=float(getattr(self.spin_gas_onset, "value", lambda: 0.0)()),
+            save_raw_csv=self.cb_save_raw.isChecked(),
             save_cleaned_csv=self.cb_save_clean.isChecked(),
-            generate_plots=(self.cb_plot_act_pos.isChecked() or self.cb_plot_kymo.isChecked()),
+            generate_plots=should_generate_plots,
             render_video_overlay=self.cb_video_overlay.isChecked(),
         )
         worker.signals.progress.connect(self.on_worker_progress)
         worker.signals.session_finished.connect(self.on_session_finished)
         worker.signals.finished.connect(self.on_worker_finished)
         worker.signals.error.connect(self.on_worker_error)
+
         self.current_worker = worker
         self.thread_pool.start(worker)
 

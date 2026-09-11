@@ -36,11 +36,12 @@ class DrosophilaBehaviorPipeline:
             savgol_poly=self.config.savgol_poly,
         )
         self.anesthesia_analyzer = AnesthesiaAnalyzer(
-            bin_size_sec=self.config.anesthesia_bin_size_sec,
-            window_duration_sec=getattr(self.config, 'anesthesia_window_duration_sec', 120.0),
-            window_bins=self.config.anesthesia_window_bins,
-            activity_threshold=self.config.anesthesia_activity_threshold,
             fps=self.config.fps,
+            anesthesia_still_sec=getattr(self.config, 'anesthesia_still_sec', 120.0),
+            anesthesia_speed_thresh=getattr(self.config, 'anesthesia_speed_thresh', 0.10),
+            sedate_speed_ratio=getattr(self.config, 'sedate_speed_ratio', 0.35),
+            drop_height_delta=getattr(self.config, 'sedate_drop_speed', 0.25),
+            anesthesia_onset_time=getattr(self.config, 'anesthesia_onset_time', 0.0),
         )
         self.visualizer = ScientificVisualizer(fps=self.config.fps)
 
@@ -50,6 +51,8 @@ class DrosophilaBehaviorPipeline:
         video_path: Optional[str] = None,
         output_dir: Optional[str] = None,
         base_name: Optional[str] = None,
+        anesthesia_onset_time: Optional[float] = None,
+        save_raw_csv: bool = True,
         save_cleaned_csv: bool = True,
         generate_plots: bool = True,
         render_video_overlay: bool = False,
@@ -59,34 +62,6 @@ class DrosophilaBehaviorPipeline:
     ) -> Dict[str, Any]:
         """
         Executes the behavioral analysis pipeline for a single session.
-
-        Parameters
-        ----------
-        csv_path : str, optional
-            Path to raw tracked CSV.
-        video_path : str, optional
-            Path to experiment video file.
-        output_dir : str, optional
-            Target output directory. Defaults to CSV or video directory.
-        base_name : str, optional
-            Prefix for generated artifacts.
-        save_cleaned_csv : bool
-            Whether to write *_cleaned.csv.
-        generate_plots : bool
-            Whether to export scientific figures.
-        render_video_overlay : bool
-            Whether to synthesize annotated overlay video.
-        chamber_rois : list of (x1, y1, x2, y2), optional
-            Chamber bounding boxes if tracking directly from video.
-        progress_callback : callable, optional
-            Progress reporter callback.
-        render_progress_callback : callable, optional
-            Progress reporter callback for video rendering.
-
-        Returns
-        -------
-        dict with keys:
-            'cleaned_df', 'anesthesia_df', 'summary_df', 'plot_paths', 'overlay_video_path', 'summary_csv_path'
         """
         start_time = time.time()
         
@@ -105,15 +80,20 @@ class DrosophilaBehaviorPipeline:
                     base_name = base_name[: -len(suffix)]
 
         out_prefix = os.path.join(target_dir, base_name)
+        raw_csv_target_path = f"{out_prefix}_raw.csv"
 
         # Step 1: Obtain raw tracking DataFrame
+        is_freshly_tracked = False
         if csv_path and os.path.exists(csv_path):
             raw_df = pd.read_csv(csv_path)
         elif video_path and os.path.exists(video_path):
             if not chamber_rois:
-                raise ValueError("Chamber ROIs required for video tracking.")
+                raise ValueError(f"Chamber ROIs required for video tracking on {base_name}.")
             tracker = FlyVisionTracker(chamber_rois=chamber_rois)
             raw_df = tracker.track_video(video_path, progress_callback=progress_callback)
+            is_freshly_tracked = True
+            if save_raw_csv:
+                raw_df.to_csv(raw_csv_target_path, index=False)
         else:
             raise FileNotFoundError(f"Input file not found: {csv_path or video_path}")
 
@@ -123,11 +103,16 @@ class DrosophilaBehaviorPipeline:
         if save_cleaned_csv:
             cleaned_df.to_csv(cleaned_csv_path, index=False)
 
-        # Step 3: Anesthesia Induction Kinetics
-        anesthesia_df = self.anesthesia_analyzer.evaluate_induction(cleaned_df, fps=self.config.fps)
+        # Step 3: Anesthesia Induction Kinetics & 3-State Evaluation
+        gas_onset = float(
+            anesthesia_onset_time
+            if anesthesia_onset_time is not None
+            else getattr(self.config, 'anesthesia_onset_time', 0.0)
+        )
+        cleaned_df = self.anesthesia_analyzer.evaluate_states(cleaned_df, anesthesia_onset_time=gas_onset)
 
         # Step 4: Summary Metrics Consolidation
-        summary_df = anesthesia_df.copy()
+        summary_df = self.anesthesia_analyzer.extract_summary(cleaned_df, anesthesia_onset_time=gas_onset)
         summary_csv_path = f"{out_prefix}_results_summary.csv"
         summary_df.to_csv(summary_csv_path, index=False)
 
@@ -136,14 +121,19 @@ class DrosophilaBehaviorPipeline:
         if generate_plots:
             act_pos_plot = f"{out_prefix}_activity_position.png"
             kymo_plot = f"{out_prefix}_kymograph_norm.png"
+            survival_plot = f"{out_prefix}_survival_kinetics.png"
+
             self.visualizer.plot_activity_position_overview(
-                cleaned_df,
-                act_pos_plot,
-                fps=self.config.fps
+                cleaned_df, act_pos_plot, fps=self.config.fps
             )
             self.visualizer.plot_kymograph_hexbin(cleaned_df, kymo_plot, fps=self.config.fps)
+            
+            # 导出累计麻醉动力学生存图
+            self.visualizer.plot_survival_kinetics(summary_df, survival_plot)
+
             plot_paths["activity_position"] = act_pos_plot
             plot_paths["kymograph"] = kymo_plot
+            plot_paths["survival_kinetics"] = survival_plot
 
         # Step 6: Video Overlay Synthesis
         overlay_video_path = None
@@ -162,7 +152,6 @@ class DrosophilaBehaviorPipeline:
             "base_name": base_name,
             "elapsed_sec": elapsed,
             "cleaned_df": cleaned_df,
-            "anesthesia_df": anesthesia_df,
             "summary_df": summary_df,
             "cleaned_csv_path": cleaned_csv_path if save_cleaned_csv else None,
             "summary_csv_path": summary_csv_path,

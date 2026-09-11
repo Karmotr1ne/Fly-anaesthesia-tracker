@@ -159,6 +159,96 @@ class ScientificVisualizer:
         plt.close()
         return output_filepath
 
+    def plot_survival_kinetics(self, summary_df: pd.DataFrame, save_path: str):
+        """
+        根据 summary_df 绘制累积击倒/麻醉生存图 (Fraction reached vs. Time after gas onset)
+        """
+        if summary_df is None or summary_df.empty:
+            return
+
+        total_n = len(summary_df)
+        if total_n == 0:
+            return
+
+        fig, ax = plt.subplots(figsize=(8, 4.5), dpi=300)
+
+        # 提取有效潜伏期数据
+        sed_latencies = summary_df["sedation_latency_sec"].dropna().to_numpy()
+        ana_latencies = summary_df["anesthesia_latency_sec"].dropna().to_numpy()
+
+        # 配色规范（对齐示例图）
+        color_sed = "#E67E22"   # 亮橙色
+        color_ana = "#B03A2E"   # 深红/红棕色
+
+        max_time = 60.0
+
+        # 1. 绘制 Sedation 曲线
+        if len(sed_latencies) > 0:
+            sorted_sed = np.sort(sed_latencies)
+            max_time = max(max_time, sorted_sed[-1])
+            # 阶梯曲线累积点：(0, 0) -> 各事件点
+            x_sed = np.concatenate(([0.0], sorted_sed))
+            y_sed = np.concatenate(([0.0], (np.arange(1, len(sorted_sed) + 1) / total_n) * 100.0))
+            ax.step(x_sed, y_sed, where="post", color=color_sed, lw=2.5, label="Sedation")
+
+            # 中位数标注
+            med_sed = float(np.median(sorted_sed))
+            ax.axvline(med_sed, color=color_sed, ls=":", lw=1.2, alpha=0.85)
+            ax.text(
+                med_sed + (max_time * 0.02),
+                60.0,
+                f"Median sed: {med_sed:.2f} s",
+                color=color_sed,
+                fontsize=9.5,
+                fontweight="medium",
+                va="center",
+            )
+
+        # 2. 绘制 Anesthesia 曲线
+        if len(ana_latencies) > 0:
+            sorted_ana = np.sort(ana_latencies)
+            max_time = max(max_time, sorted_ana[-1])
+            x_ana = np.concatenate(([0.0], sorted_ana))
+            y_ana = np.concatenate(([0.0], (np.arange(1, len(sorted_ana) + 1) / total_n) * 100.0))
+            ax.step(x_ana, y_ana, where="post", color=color_ana, lw=2.5, label="Anesthesia")
+
+            # 中位数标注
+            med_ana = float(np.median(sorted_ana))
+            ax.axvline(med_ana, color=color_ana, ls=":", lw=1.2, alpha=0.85)
+            ax.text(
+                med_ana + (max_time * 0.02),
+                52.0,
+                f"Median anes: {med_ana:.2f} s",
+                color=color_ana,
+                fontsize=9.5,
+                fontweight="medium",
+                va="center",
+            )
+
+        # 3. 气体释放起始线 (Time = 0)
+        ax.axvline(0.0, color="#94A3B8", ls="--", lw=1.2, alpha=0.85)
+        ax.text(1.5, 2.0, "CO2 onset", color="#64748B", fontsize=9, va="bottom")
+
+        # 4. 坐标轴与排版美化
+        ax.set_xlabel("Time after gas onset (s)", fontsize=10.5, fontweight="bold", labelpad=6)
+        ax.set_ylabel("Fraction reached (%)", fontsize=10.5, fontweight="bold", labelpad=6)
+        ax.set_ylim(-2, 105)
+        ax.set_xlim(-max_time * 0.03, max_time * 1.08)
+
+        # 仅保留底部和左侧轴脊柱
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_linewidth(1.2)
+        ax.spines["bottom"].set_linewidth(1.2)
+
+        ax.grid(axis="x", linestyle="-", color="#F1F5F9", lw=0.8)
+        ax.legend(frameon=False, loc="lower right", fontsize=10)
+
+        plt.tight_layout()
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        plt.savefig(save_path, dpi=300)
+        plt.close(fig)
+
     def render_overlay_video(
         self,
         cleaned_df: pd.DataFrame,
