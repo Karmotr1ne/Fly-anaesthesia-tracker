@@ -259,221 +259,6 @@ class TrackingOnlyWorker(QRunnable):
 
         self.signals.finished.emit(all_results)
 
-
-class PipelineBatchWorker(QRunnable):
-    def __init__(
-        self,
-        matched_pairs: Dict[str, dict],
-        config: PipelineConfig,
-        anesthesia_onset_time: float = 0.0,
-        save_raw_csv: bool = True,
-        save_cleaned_csv: bool = True,
-        plot_act_pos: bool = True,
-        plot_kymo: bool = True,
-        render_video_overlay: bool = False,
-    ):
-        super().__init__()
-        self.matched_pairs = matched_pairs
-        self.config = config
-        self.anesthesia_onset_time = anesthesia_onset_time
-        self.save_raw_csv = save_raw_csv
-        self.save_cleaned_csv = save_cleaned_csv
-        self.plot_act_pos = plot_act_pos
-        self.plot_kymo = plot_kymo
-        self.render_video_overlay = render_video_overlay
-        self.signals = WorkerSignals()
-        self._is_cancelled = False
-
-    def cancel(self):
-        self._is_cancelled = True
-
-    @pyqtSlot()
-    def run(self):
-        total_sessions = len(self.matched_pairs)
-        processed = 0
-        all_results = {}
-
-        cleaner = KinematicCleaner(fps=getattr(self.config, "fps", 30.0))
-        analyzer = AnesthesiaAnalyzer(
-            fps=getattr(self.config, "fps", 30.0),
-            anesthesia_still_sec=getattr(self.config, "anesthesia_still_sec", 120.0),
-            anesthesia_speed_thresh=getattr(self.config, "anesthesia_speed_thresh", 0.10),
-            sedate_speed_ratio=getattr(self.config, "sedate_speed_ratio", 0.35),
-            sedate_drop_speed=getattr(self.config, "sedate_drop_speed", 0.25),
-            anesthesia_onset_time=self.anesthesia_onset_time,
-        )
-        visualizer = ScientificVisualizer(fps=getattr(self.config, "fps", 30.0))
-
-        for idx, (base, paths) in enumerate(self.matched_pairs.items(), start=1):
-            if self._is_cancelled:
-                self.signals.progress.emit(
-                    processed,
-                    total_sessions,
-                    f"Task cancelled ({processed}/{total_sessions}).",
-                )
-                break
-
-            out_dir = os.path.dirname(os.path.abspath(paths.get("csv") or paths.get("video") or "."))
-            raw_csv = paths.get("csv")
-            vid_path = paths.get("video")
-
-            try:
-                if not raw_csv or not os.path.exists(raw_csv):
-                    if not vid_path or not os.path.exists(vid_path):
-                        raise FileNotFoundError(f"No valid video or CSV found for session '{base}'.")
-
-                    ch_rois = paths.get("chamber_rois")
-                    if not ch_rois:
-                        cap = cv2.VideoCapture(vid_path)
-                        ret, frame = cap.read()
-                        cap.release()
-                        if ret and frame is not None:
-                            configs = SymmetricGridAligner.generate_symmetric_chambers(
-                                frame_shape=frame.shape,
-                                rows=getattr(self.config, "grid_rows", 4),
-                                cols=getattr(self.config, "grid_cols", 2),
-                                order=getattr(self.config, "grid_order", "column_first"),
-                            )
-                            ch_rois = [c["roi"] for c in configs]
-                            paths["chamber_rois"] = ch_rois
-
-                    last_t = [time.time()]
-                    last_f = [0]
-                    current_fps = [0.0]
-
-                    def on_tracking_progress(f_cur: int, f_tot: int):
-                        if self._is_cancelled:
-                            return
-                        if f_tot > 0 and (f_cur % 15 == 0 or f_cur == f_tot):
-                            curr_t = time.time()
-                            dt = curr_t - last_t[0]
-                            df = f_cur - last_f[0]
-                            if dt >= 0.05 and df > 0:
-                                current_fps[0] = df / dt
-                                last_t[0] = curr_t
-                                last_f[0] = f_cur
-                            pct = min(100, max(0, int((f_cur / f_tot) * 100)))
-                            msg = (
-                                f"Tracking [{base}] ({idx}/{total_sessions}): "
-                                f"{pct}% ({f_cur}/{f_tot} frames) | {current_fps[0]:.1f} fps"
-                            )
-                            self.signals.progress.emit(processed, total_sessions, msg)
-
-                    tracker = FlyVisionTracker(chamber_rois=ch_rois)
-                    raw_df = tracker.track_video(vid_path, progress_callback=on_tracking_progress)
-
-                    if self.save_raw_csv:
-                        raw_csv = os.path.join(out_dir, f"{base}_raw.csv")
-                        raw_df.to_csv(raw_csv, index=False)
-                        paths["csv"] = raw_csv
-                else:
-                    self.signals.progress.emit(
-                        processed,
-                        total_sessions,
-                        f"[{SessionPhase.READING_CSV.value}] {base}...",
-                    )
-                    raw_df = pd.read_csv(raw_csv)
-
-                if self._is_cancelled:
-                    break
-
-                self.signals.progress.emit(
-                    processed,
-                    total_sessions,
-                    f"[{SessionPhase.CLEANING.value}] {base}...",
-                )
-                cleaned_df = cleaner.clean_trajectory(raw_df)
-                cleaned_csv_path = os.path.join(out_dir, f"{base}_cleaned.csv")
-                if self.save_cleaned_csv:
-                    cleaned_df.to_csv(cleaned_csv_path, index=False)
-
-                if self._is_cancelled:
-                    break
-
-                plot_files = {}
-                if self.plot_act_pos or self.plot_kymo:
-                    self.signals.progress.emit(
-                        processed,
-                        total_sessions,
-                        f"[{SessionPhase.PLOTTING_EARLY.value}] {base}...",
-                    )
-                    if self.plot_act_pos:
-                        act_pos_path = os.path.join(out_dir, f"{base}_activity_position.png")
-                        visualizer.plot_activity_position_overview(cleaned_df, act_pos_path)
-                        plot_files["act_pos"] = act_pos_path
-
-                    if self.plot_kymo:
-                        kymo_path = os.path.join(out_dir, f"{base}_kymograph_norm.png")
-                        visualizer.plot_kymograph_hexbin(cleaned_df, kymo_path)
-                        plot_files["kymo"] = kymo_path
-
-                if self._is_cancelled:
-                    break
-
-                self.signals.progress.emit(
-                    processed,
-                    total_sessions,
-                    f"[{SessionPhase.ANALYZING.value}] {base}...",
-                )
-                try:
-                    df_with_states = analyzer.evaluate_states(
-                        cleaned_df,
-                        anesthesia_onset_time=self.anesthesia_onset_time,
-                    )
-                except TypeError:
-                    df_with_states = analyzer.evaluate_states(cleaned_df)
-
-                try:
-                    summary_df = analyzer.extract_summary(
-                        df_with_states,
-                        anesthesia_onset_time=self.anesthesia_onset_time,
-                    )
-                except TypeError:
-                    summary_df = analyzer.extract_summary(df_with_states)
-
-                summary_csv_path = os.path.join(out_dir, f"{base}_summary.csv")
-                summary_df.to_csv(summary_csv_path, index=False)
-
-                if self._is_cancelled:
-                    break
-
-                overlay_path = None
-                if self.render_video_overlay and vid_path and os.path.exists(vid_path):
-                    self.signals.progress.emit(
-                        processed,
-                        total_sessions,
-                        f"[{SessionPhase.RENDERING.value}] {base}...",
-                    )
-                    overlay_path = os.path.join(out_dir, f"{base}_overlay.mp4")
-                    visualizer.render_overlay_video(df_with_states, vid_path, overlay_path)
-
-                session_res = {
-                    "cleaned_csv": cleaned_csv_path if self.save_cleaned_csv else None,
-                    "summary_csv": summary_csv_path,
-                    "plots": plot_files,
-                    "overlay_video": overlay_path,
-                    "summary_data": summary_df.to_dict(orient="records") if hasattr(summary_df, "to_dict") else None,
-                }
-                all_results[base] = session_res
-                processed += 1
-                self.signals.session_finished.emit(base, session_res)
-                self.signals.progress.emit(
-                    processed,
-                    total_sessions,
-                    f"[{SessionPhase.COMPLETED.value}] {base} ({processed}/{total_sessions})",
-                )
-
-            except Exception as e:
-                self.signals.error.emit(base, str(e))
-                self.signals.progress.emit(
-                    processed,
-                    total_sessions,
-                    f"[{SessionPhase.FAILED.value}] Error on {base}",
-                )
-
-        self.signals.finished.emit(all_results)
-
-
 # =====================================================================
 # Interactive Multi-Chamber Calibration Canvas
 # =====================================================================
@@ -1292,173 +1077,7 @@ class ChamberCalibrationDialog(QDialog):
 
 
 # =====================================================================
-# Drag & Drop File Import Area
-# =====================================================================
-class DragDropArea(QFrame):
-    filesChanged = pyqtSignal(list)
-
-    def __init__(self):
-        super().__init__()
-        self.setAcceptDrops(True)
-        self.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Plain)
-        self.setLineWidth(2)
-        self.setMinimumHeight(140)
-        self.setStyleSheet("""
-            QFrame {
-                border: 2px dashed #90A4AE;
-                border-radius: 8px;
-                background-color: #FAFAFA;
-            }
-        """)
-        layout = QVBoxLayout()
-        self.label = QLabel("Drag and Drop CSV or Video files here\n(or click to browse)")
-        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.label.setStyleSheet("color: #455A64; font-size: 14px; font-weight: 500;")
-        layout.addWidget(self.label)
-        self.setLayout(layout)
-        self.all_files = []
-
-    def mousePressEvent(self, event):
-        files, _ = QFileDialog.getOpenFileNames(
-            self,
-            "Select Experiment Files",
-            "",
-            "Experiment Data or Videos (*.csv *.mp4 *.avi *.mov *.mkv);;All Files (*.*)"
-        )
-        if files:
-            for f in files:
-                if f not in self.all_files:
-                    self.all_files.append(f)
-            self.filesChanged.emit(self.all_files)
-
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.accept()
-            self.setStyleSheet("""
-                QFrame {
-                    border: 2px dashed #1976D2;
-                    border-radius: 8px;
-                    background-color: #E3F2FD;
-                }
-            """)
-        else:
-            event.ignore()
-
-    def dragLeaveEvent(self, event):
-        self.setStyleSheet("""
-            QFrame {
-                border: 2px dashed #90A4AE;
-                border-radius: 8px;
-                background-color: #FAFAFA;
-            }
-        """)
-
-    def dropEvent(self, event):
-        self.setStyleSheet("""
-            QFrame {
-                border: 2px dashed #90A4AE;
-                border-radius: 8px;
-                background-color: #FAFAFA;
-            }
-        """)
-        urls = event.mimeData().urls()
-        new_files = [u.toLocalFile() for u in urls if u.toLocalFile()]
-        for f in new_files:
-            if f not in self.all_files:
-                self.all_files.append(f)
-        self.filesChanged.emit(self.all_files)
-
-
-# =====================================================================
-# Background Asynchronous Workers
-# =====================================================================
-class WorkerSignals(QObject):
-    progress = pyqtSignal(int, int, str)
-    session_finished = pyqtSignal(str, dict)
-    finished = pyqtSignal(dict)
-    error = pyqtSignal(str, str)
-
-
-class TrackingOnlyWorker(QRunnable):
-    """
-    Dedicated worker for batch video vision tracking, producing *_raw.csv.
-    """
-    def __init__(self, matched_pairs: Dict[str, dict], config: PipelineConfig):
-        super().__init__()
-        self.matched_pairs = matched_pairs
-        self.config = config
-        self.signals = WorkerSignals()
-        self._is_cancelled = False
-
-    def cancel(self):
-        self._is_cancelled = True
-
-    @pyqtSlot()
-    def run(self):
-        video_sessions = {k: v for k, v in self.matched_pairs.items() if v.get("video")}
-        total_sessions = len(video_sessions)
-        processed = 0
-        all_results = {}
-
-        for idx, (base, paths) in enumerate(video_sessions.items(), start=1):
-            if self._is_cancelled:
-                self.signals.progress.emit(processed, total_sessions, f"Task cancelled ({idx}/{total_sessions}).")
-                break
-            
-            vid_path = paths["video"]
-            ch_rois = paths.get("chamber_rois")
-            
-            if not ch_rois:
-                cap = cv2.VideoCapture(vid_path)
-                ret, frame = cap.read()
-                cap.release()
-                if ret and frame is not None:
-                    configs = SymmetricGridAligner.generate_symmetric_chambers(
-                        frame_shape=frame.shape,
-                        rows=self.config.grid_rows,
-                        cols=self.config.grid_cols,
-                        order=self.config.grid_order,
-                    )
-                    ch_rois = [c["roi"] for c in configs]
-                    paths["chamber_rois"] = ch_rois
-
-            out_dir = os.path.dirname(os.path.abspath(vid_path))
-            raw_csv_path = os.path.join(out_dir, f"{base}_raw.csv")
-
-            start_t = time.time()
-            last_t = [start_t]
-
-            def on_frame_progress(f_cur, f_tot):
-                if f_tot > 0:
-                    curr_t = time.time()
-                    dt = max(1e-5, curr_t - last_t[0])
-                    fps_val = 100.0 / dt
-                    last_t[0] = curr_t
-                    pct = int((f_cur / f_tot) * 100)
-                    self.signals.progress.emit(
-                        processed,
-                        total_sessions,
-                        f"Tracking [{base}]: {pct}% ({f_cur}/{f_tot} frames) | {fps_val:.1f} fps"
-                    )
-
-            try:
-                tracker = FlyVisionTracker(chamber_rois=ch_rois)
-                raw_df = tracker.track_video(vid_path, progress_callback=on_frame_progress)
-                raw_df.to_csv(raw_csv_path, index=False)
-                
-                paths["csv"] = raw_csv_path
-                all_results[base] = {"raw_csv": raw_csv_path, "frames": len(raw_df)}
-                processed += 1
-                self.signals.session_finished.emit(base, all_results[base])
-                self.signals.progress.emit(processed, total_sessions, f"Finished video tracking: {base} ({processed}/{total_sessions})")
-            except Exception as e:
-                self.signals.error.emit(base, str(e))
-
-        self.signals.finished.emit(all_results)
-
-
-# =====================================================================
-# PipelineBatchWorker (完整替换)
+# PipelineBatchWorker
 # =====================================================================
 class PipelineBatchWorker(QRunnable):
     """
@@ -1667,10 +1286,9 @@ class MainWindow(QMainWindow):
         vbox_a = QVBoxLayout()
         self.cb_save_clean = QCheckBox("Export Cleaned Location Data (*_cleaned.csv)")
         self.cb_save_clean.setChecked(True)
-        vbox_prep.addWidget(self.cb_save_raw)
-        vbox_prep.addWidget(self.cb_save_clean)
-        grp_prep.setLayout(vbox_prep)
-        right_layout.addWidget(grp_prep)
+        vbox_a.addWidget(self.cb_save_clean)
+        grp_a.setLayout(vbox_a)
+        right_layout.addWidget(grp_a)
 
         # Module 3: Kinetics & Gas Delivery Onset
         grp_b = QGroupBox("Module 3:Gas Delivery Onset and Kinetics Thresholds")
@@ -1748,7 +1366,7 @@ class MainWindow(QMainWindow):
         self.cb_plot_kymo.setChecked(True)
         
         # 新增：生存阶梯图复选框
-        self.cb_plot_survival = QCheckBox("Cumulative Survival/Knockdown Curves (*_survival_kinetics.png)")
+        self.cb_plot_survival = QCheckBox("Cumulative Survival Curves (*_survival_kinetics.png)")
         self.cb_plot_survival.setChecked(True)
         
         self.cb_video_overlay = QCheckBox("Render Annotated Video Overlay (*_overlay.mp4)")
@@ -1877,7 +1495,9 @@ class MainWindow(QMainWindow):
             order=session.get("grid_order", getattr(self.config, "grid_order", "column_first")),
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            session["chamber_rois"] = dlg.get_chambers()
+            # 显式保存 rois 变量，解决未定义报错
+            rois = dlg.get_chambers()
+            session["chamber_rois"] = rois
             session["grid_rows"] = dlg.rows
             session["grid_cols"] = dlg.cols
             session["grid_order"] = dlg.order
@@ -1886,18 +1506,6 @@ class MainWindow(QMainWindow):
                 "Calibration Saved",
                 f"Successfully saved {len(rois)} chamber bounding boxes for:\n{base}"
             )
-
-    def clear_all(self):
-        self.drop_area.all_files = []
-        self.pair_list.clear()
-        self.matched_pairs = {}
-        self.drop_area.label.setText("Drag and Drop CSV or Video files here\n(or click to browse)")
-        self.lbl_status.setText("Ready, awaiting task execution.")
-
-    def _on_anesthesia_duration_changed(self, val: int):
-        bins = max(1, int(round(val / self.config.anesthesia_bin_size_sec)))
-        minutes = val / 60.0
-        self.lbl_window_info.setText(f"({minutes:.1f} min, {bins} bins)")
 
     def cancel_execution(self):
         if self.current_worker:
@@ -1969,7 +1577,7 @@ class MainWindow(QMainWindow):
         self.btn_cancel.setEnabled(True)
         self.lbl_status.setText("Starting asynchronous processing thread pool...")
 
-        # 聚合所有绘图复选框状态，后续增删图表仅需在元组内增减控件属性
+        # 1. 聚合图表复选框（修复签名不匹配）
         plot_checkboxes = (
             self.cb_plot_act_pos,
             self.cb_plot_kymo,
@@ -1977,16 +1585,19 @@ class MainWindow(QMainWindow):
         )
         should_generate_plots = any(cb.isChecked() for cb in plot_checkboxes if cb is not None)
 
+        # 2. 构造 Worker（严格对齐形参列表）
         worker = PipelineBatchWorker(
             matched_pairs=self.matched_pairs,
             config=self.config,
-            anesthesia_onset_time=float(getattr(self.spin_gas_onset, "value", lambda: 0.0)()),
+            anesthesia_onset_time=float(self.spin_gas_onset.value()),
             save_raw_csv=self.cb_save_raw.isChecked(),
             save_cleaned_csv=self.cb_save_clean.isChecked(),
             generate_plots=should_generate_plots,
             render_video_overlay=self.cb_video_overlay.isChecked(),
         )
-        worker.signals.progress.connect(self.on_worker_progress)
+
+        # 3. 绑定正确的槽函数（修复 AttributeError）
+        worker.signals.progress.connect(self.update_status_progress) #[cite: 7, 8]
         worker.signals.session_finished.connect(self.on_session_finished)
         worker.signals.finished.connect(self.on_worker_finished)
         worker.signals.error.connect(self.on_worker_error)
@@ -2014,35 +1625,6 @@ class MainWindow(QMainWindow):
         worker.signals.progress.connect(self.update_status_progress)
         worker.signals.session_finished.connect(self.on_tracking_session_finished)
         worker.signals.finished.connect(self.on_tracking_finished)
-        worker.signals.error.connect(self.on_worker_error)
-
-        self.current_worker = worker
-        self.thread_pool.start(worker)
-
-    def execute_tasks(self):
-        if not self.matched_pairs:
-            QMessageBox.warning(self, "Warning", "No sessions loaded for execution!")
-            return
-
-        self.sync_ui_to_config()
-        self.btn_run.setEnabled(False)
-        self.btn_track_only.setEnabled(False)
-        self.btn_cancel.setEnabled(True)
-        self.lbl_status.setText("Starting asynchronous processing thread pool...")
-
-        worker = PipelineBatchWorker(
-            matched_pairs=self.matched_pairs,
-            config=self.config,
-            anesthesia_onset_time=float(self.spin_gas_onset.value()),
-            save_raw_csv=self.cb_save_raw.isChecked(),
-            save_cleaned_csv=self.cb_save_clean.isChecked(),
-            plot_act_pos=self.cb_plot_act_pos.isChecked(),
-            plot_kymo=self.cb_plot_kymo.isChecked(),
-            render_video_overlay=self.cb_video_overlay.isChecked(),
-        )
-        worker.signals.progress.connect(self.update_status_progress)
-        worker.signals.session_finished.connect(self.on_session_finished)
-        worker.signals.finished.connect(self.on_worker_finished)
         worker.signals.error.connect(self.on_worker_error)
 
         self.current_worker = worker

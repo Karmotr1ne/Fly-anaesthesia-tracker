@@ -55,8 +55,6 @@ class DrosophilaBehaviorPipeline:
         base_name: Optional[str] = None,
         anesthesia_onset_time: Optional[float] = None,
         save_raw_csv: bool = True,
-        anesthesia_onset_time: Optional[float] = None,
-        save_raw_csv: bool = True,
         save_cleaned_csv: bool = True,
         generate_plots: bool = True,
         render_video_overlay: bool = False,
