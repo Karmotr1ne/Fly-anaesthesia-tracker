@@ -1,8 +1,13 @@
 """
 Pipeline Orchestrator
 =====================
-Unifies Modules 1 through 4 (Tracking, Cleaning, Stationary Engine & Anesthesia, Visualizer)
-into an end-to-end processing pipeline.
+Unifies Modules 1 through 5 into an end-to-end processing pipeline.
+Execution Flow:
+1. Vision Tracking / Load Raw Data
+2. Kinematic Cleaning
+3. Early Plotting (Dual Y-Axis Activity/Position & Normalized Kymograph Heatmap)
+4. Anesthesia Kinetics Analysis (Baseline Calibration & 3-State Machine)
+5. State Spectrograms & Video Overlay Rendering
 """
 
 import os
@@ -11,7 +16,7 @@ from typing import Optional, Dict, Any, List, Tuple
 import pandas as pd
 import numpy as np
 
-from .models import PipelineConfig, AnesthesiaSummary
+from .models import PipelineConfig
 from .tracker import FlyVisionTracker, get_video_metadata
 from .cleaner import KinematicCleaner
 from .anesthesia import AnesthesiaAnalyzer
@@ -19,10 +24,6 @@ from .visualizer import ScientificVisualizer
 
 
 class DrosophilaBehaviorPipeline:
-    """
-    End-to-end processing orchestrator for Drosophila Anesthesia experiments.
-    """
-
     def __init__(self, config: Optional[PipelineConfig] = None):
         self.config = config or PipelineConfig()
         self.cleaner = KinematicCleaner(
@@ -35,6 +36,7 @@ class DrosophilaBehaviorPipeline:
             savgol_window=self.config.savgol_window,
             savgol_poly=self.config.savgol_poly,
         )
+        # 对齐麻醉时间参数接口
         self.anesthesia_analyzer = AnesthesiaAnalyzer(
             fps=self.config.fps,
             anesthesia_still_sec=getattr(self.config, 'anesthesia_still_sec', 120.0),
@@ -53,6 +55,8 @@ class DrosophilaBehaviorPipeline:
         base_name: Optional[str] = None,
         anesthesia_onset_time: Optional[float] = None,
         save_raw_csv: bool = True,
+        anesthesia_onset_time: Optional[float] = None,
+        save_raw_csv: bool = True,
         save_cleaned_csv: bool = True,
         generate_plots: bool = True,
         render_video_overlay: bool = False,
@@ -65,7 +69,6 @@ class DrosophilaBehaviorPipeline:
         """
         start_time = time.time()
         
-        # 1. Resolve output directory and base name
         ref_path = csv_path or video_path
         if not ref_path:
             raise ValueError("Must provide at least csv_path or video_path.")
@@ -81,27 +84,73 @@ class DrosophilaBehaviorPipeline:
 
         out_prefix = os.path.join(target_dir, base_name)
         raw_csv_target_path = f"{out_prefix}_raw.csv"
+        raw_csv_target_path = f"{out_prefix}_raw.csv"
 
-        # Step 1: Obtain raw tracking DataFrame
+        # 确定麻醉释放时间戳（优先使用传参，兜底使用 config）
+        gas_onset = float(
+            anesthesia_onset_time
+            if anesthesia_onset_time is not None
+            else getattr(self.config, "anesthesia_onset_time", 0.0)
+        )
+
+        # -----------------------------------------------------------------
+        # 阶段 1: 判定数据源（优先加载已有 CSV，无 CSV 时才触发视觉跟踪）
+        # -----------------------------------------------------------------
+        is_freshly_tracked = False
+
         is_freshly_tracked = False
         if csv_path and os.path.exists(csv_path):
             raw_df = pd.read_csv(csv_path)
+            raw_csv_path = csv_path
         elif video_path and os.path.exists(video_path):
             if not chamber_rois:
                 raise ValueError(f"Chamber ROIs required for video tracking on {base_name}.")
+                raise ValueError(f"Chamber ROIs required for video tracking on {base_name}.")
             tracker = FlyVisionTracker(chamber_rois=chamber_rois)
             raw_df = tracker.track_video(video_path, progress_callback=progress_callback)
+            is_freshly_tracked = True
+            raw_csv_path = raw_csv_target_path
             is_freshly_tracked = True
             if save_raw_csv:
                 raw_df.to_csv(raw_csv_target_path, index=False)
         else:
             raise FileNotFoundError(f"Input file not found: {csv_path or video_path}")
 
-        # Step 2: Kinematic Cleaning & Artifact Clamping
+        if is_freshly_tracked and save_raw_csv:
+            raw_df.to_csv(raw_csv_target_path, index=False)
+
+        # -----------------------------------------------------------------
+        # 阶段 2: 运动学清洗
+        # -----------------------------------------------------------------
         cleaned_df = self.cleaner.clean_trajectory(raw_df)
+
+        # -----------------------------------------------------------------
+        # 阶段 3: 【先绘图】在状态判定前，先绘制双 Y 轴图与 Kymograph 热图
+        # -----------------------------------------------------------------
+        plot_paths = {}
+        if generate_plots:
+            # 1. 双 Y 轴行为概览图 (Activity / Velocity & Position)
+            act_pos_plot = f"{out_prefix}_activity_position.png"
+            self.visualizer.plot_activity_position_overview(cleaned_df, act_pos_plot)
+            plot_paths["activity_position"] = act_pos_plot
+
+            # 2. 空间-时间归一化 Hexbin 热图
+            kymo_plot = f"{out_prefix}_kymograph_norm.png"
+            self.visualizer.plot_kymograph_hexbin(cleaned_df, kymo_plot)
+            plot_paths["kymograph"] = kymo_plot
+
+        # -----------------------------------------------------------------
+        # 阶段 4: 【后判定】三阶段状态判定与动力学汇总（执行 Baseline 校正）
+        # -----------------------------------------------------------------
+        # 在给药前的数据严格用于个体 baseline 校正，且在此之前状态强制为 Active
+        df_with_states = self.anesthesia_analyzer.evaluate_states(
+            cleaned_df,
+            anesthesia_onset_time=gas_onset
+        )
+
         cleaned_csv_path = f"{out_prefix}_cleaned.csv"
         if save_cleaned_csv:
-            cleaned_df.to_csv(cleaned_csv_path, index=False)
+            df_with_states.to_csv(cleaned_csv_path, index=False)
 
         # Step 3: Anesthesia Induction Kinetics & 3-State Evaluation
         gas_onset = float(
@@ -116,8 +165,7 @@ class DrosophilaBehaviorPipeline:
         summary_csv_path = f"{out_prefix}_results_summary.csv"
         summary_df.to_csv(summary_csv_path, index=False)
 
-        # Step 5: Scientific Plotting
-        plot_paths = {}
+        # 状态机衍生图表（依赖 state 列）
         if generate_plots:
             act_pos_plot = f"{out_prefix}_activity_position.png"
             kymo_plot = f"{out_prefix}_kymograph_norm.png"
@@ -135,12 +183,14 @@ class DrosophilaBehaviorPipeline:
             plot_paths["kymograph"] = kymo_plot
             plot_paths["survival_kinetics"] = survival_plot
 
-        # Step 6: Video Overlay Synthesis
+        # -----------------------------------------------------------------
+        # 阶段 5: 最终视频重合标注渲染（Overlay Video）
+        # -----------------------------------------------------------------
         overlay_video_path = None
         if render_video_overlay and video_path and os.path.exists(video_path):
             overlay_video_path = f"{out_prefix}_cleaned_overlay.mp4"
             self.visualizer.render_overlay_video(
-                cleaned_df,
+                df_with_states,
                 video_path,
                 overlay_video_path,
                 scale=None,

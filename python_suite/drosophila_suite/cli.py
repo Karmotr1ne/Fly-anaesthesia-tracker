@@ -5,6 +5,7 @@ Headless execution script for high-throughput cluster and server batch jobs.
 """
 
 import argparse
+from email import parser
 import sys
 import os
 import glob
@@ -30,27 +31,24 @@ def main():
     parser.add_argument("--dir", type=str, help="Batch directory containing CSVs or videos")
     parser.add_argument("--out", type=str, help="Output directory for generated artifacts")
     parser.add_argument("--fps", type=float, default=30.0, help="Camera frame rate (default: 30.0)")
-    parser.add_argument("--window-sec", type=float, default=120.0, help="Sedation evaluation window duration in seconds (default: 120.0)")
+    parser.add_argument("--still-sec", type=float, default=120.0, help="Anaesthesia still duration (default: 120.0s)")
+    parser.add_argument("--speed-ratio", type=float, default=0.35, help="Sedate speed decay ratio (default: 0.35)")
+    parser.add_argument("--drop-thresh", type=float, default=0.25, help="Sedate 1s drop height threshold (default: 0.25)")
+
     parser.add_argument("--no-plots", action="store_true", help="Skip scientific figure generation")
     parser.add_argument("--overlay", action="store_true", help="Render annotated overlay video")
     parser.add_argument("--gui", action="store_true", help="Launch PyQt6 Desktop GUI")
 
+
     args = parser.parse_args()
-
-    if args.gui:
-        from .gui_app import run_gui
-        run_gui()
-        return
-
-    if not args.csv and not args.video and not args.dir:
-        parser.print_help()
-        sys.exit(1)
 
     config = PipelineConfig(
         fps=args.fps,
-        anesthesia_window_duration_sec=args.window_sec,
-        anesthesia_window_bins=max(1, int(round(args.window_sec / 5.0)))
+        anesthesia_still_sec=args.still_sec,
+        sedate_speed_ratio=args.speed_ratio,
+        sedate_drop_speed=args.drop_thresh
     )
+    
     pipeline = DrosophilaBehaviorPipeline(config=config)
 
     if args.dir:

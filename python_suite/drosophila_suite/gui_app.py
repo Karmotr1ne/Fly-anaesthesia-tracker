@@ -2,21 +2,22 @@
 Desktop Application (PyQt6)
 ===========================
 Workstation Desktop GUI: Supports drag-and-drop file pairing, interactive multi-chamber grid calibration,
-fly vision tracking, kinematic cleaning, and anesthesia induction kinetics analysis.
+fly vision tracking, kinematic cleaning, dual-Y & kymograph plotting, anesthesia induction kinetics analysis,
+and annotated video synthesis.
 """
 
 import os
 import re
 import sys
 import time
-import threading
 from typing import Dict, List, Tuple, Optional, Any
+from enum import Enum
 import pandas as pd
 import numpy as np
 
 try:
     from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QObject, QRunnable, QThreadPool, QPointF, QRectF
-    from PyQt6.QtGui import QImage, QPixmap, QColor, QPen, QPainter, QFont, QBrush, QCursor
+    from PyQt6.QtGui import QImage, QColor, QPen, QPainter, QFont, QBrush, QCursor, QKeySequence, QShortcut
     from PyQt6.QtWidgets import (
         QApplication,
         QMainWindow,
@@ -28,21 +29,15 @@ try:
         QPushButton,
         QCheckBox,
         QGroupBox,
-        QProgressBar,
         QListWidget,
         QMessageBox,
         QFrame,
         QFileDialog,
         QSpinBox,
         QDoubleSpinBox,
-        QTabWidget,
-        QTextEdit,
-        QSlider,
-        QButtonGroup,
         QRadioButton,
         QComboBox,
         QScrollArea,
-        QGridLayout,
     )
 except ImportError:
     pass
@@ -52,6 +47,9 @@ import cv2
 try:
     from .pipeline import DrosophilaBehaviorPipeline
     from .models import PipelineConfig
+    from .cleaner import KinematicCleaner
+    from .anesthesia import AnesthesiaAnalyzer
+    from .visualizer import ScientificVisualizer
     from .tracker import (
         RobustGridAligner,
         SymmetricGridAligner,
@@ -61,44 +59,429 @@ try:
         get_video_metadata,
     )
 except (ImportError, ValueError):
-    # Fallback when executed directly as a standalone script
     cur_dir = os.path.dirname(os.path.abspath(__file__))
     parent_dir = os.path.dirname(cur_dir)
     if parent_dir not in sys.path:
         sys.path.insert(0, parent_dir)
-    from drosophila_suite.pipeline import DrosophilaBehaviorPipeline
-    from drosophila_suite.models import PipelineConfig
-    from drosophila_suite.tracker import (
-        RobustGridAligner,
-        SymmetricGridAligner,
-        Interactive8ChamberCalibrator,
-        RobustFlyTracker,
-        FlyVisionTracker,
-        get_video_metadata,
-    )
+    try:
+        from drosophila_suite.pipeline import DrosophilaBehaviorPipeline
+        from drosophila_suite.models import PipelineConfig
+        from drosophila_suite.cleaner import KinematicCleaner
+        from drosophila_suite.anesthesia import AnesthesiaAnalyzer
+        from drosophila_suite.visualizer import ScientificVisualizer
+        from drosophila_suite.tracker import (
+            RobustGridAligner,
+            SymmetricGridAligner,
+            Interactive8ChamberCalibrator,
+            RobustFlyTracker,
+            FlyVisionTracker,
+            get_video_metadata,
+        )
+    except ImportError:
+        pass
 
-from enum import Enum
 
 class SessionPhase(str, Enum):
     IDLE = "Idle"
     READING_CSV = "Loading CSV"
     TRACKING = "Vision Tracking"
     CLEANING = "Kinematic Cleaning"
-    ANALYZING = "Anesthesia Kinetics"
-    PLOTTING = "Generating Plots"
+    PLOTTING_EARLY = "Generating Plots (Dual Y & Kymo)"
+    ANALYZING = "Anesthesia Kinetics (State Machine)"
     RENDERING = "Rendering Overlay Video"
     COMPLETED = "Completed"
     FAILED = "Failed"
 
 
 # =====================================================================
-# Interactive Multi-Chamber Calibration Canvas (Direct Drag & 8-Way Handles)
+# Drag & Drop File Import Area
+# =====================================================================
+class DragDropArea(QFrame):
+    filesChanged = pyqtSignal(list)
+
+    def __init__(self):
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Plain)
+        self.setLineWidth(2)
+        self.setMinimumHeight(140)
+        self.default_style = "QFrame { border: 2px dashed #90A4AE; border-radius: 8px; background-color: #FAFAFA; }"
+        self.active_style = "QFrame { border: 2px dashed #0284C7; border-radius: 8px; background-color: #F0F9FF; }"
+        self.setStyleSheet(self.default_style)
+
+        layout = QVBoxLayout()
+        self.label = QLabel("Drag & Drop CSV or Video files here\n(or click to browse)")
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label.setStyleSheet("color: #455A64; font-size: 14px; font-weight: 500;")
+        layout.addWidget(self.label)
+        self.setLayout(layout)
+        self.all_files = []
+
+    def mousePressEvent(self, event):
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Experiment Files",
+            "",
+            "Experiment Data (*.csv *.mp4 *.avi *.mov *.mkv);;All Files (*.*)",
+        )
+        if files:
+            for f in files:
+                if f not in self.all_files:
+                    self.all_files.append(f)
+            self.filesChanged.emit(self.all_files)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.accept()
+            self.setStyleSheet(self.active_style)
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self.setStyleSheet(self.default_style)
+
+    def dropEvent(self, event):
+        self.setStyleSheet(self.default_style)
+        urls = event.mimeData().urls()
+        new_files = [u.toLocalFile() for u in urls if u.toLocalFile()]
+        for f in new_files:
+            if f not in self.all_files:
+                self.all_files.append(f)
+        self.filesChanged.emit(self.all_files)
+
+
+# =====================================================================
+# Background Asynchronous Workers & Signals
+# =====================================================================
+class WorkerSignals(QObject):
+    progress = pyqtSignal(int, int, str)
+    session_finished = pyqtSignal(str, dict)
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str, str)
+
+
+class TrackingOnlyWorker(QRunnable):
+    def __init__(self, matched_pairs: Dict[str, dict], config: PipelineConfig, save_raw_csv: bool = True):
+        super().__init__()
+        self.matched_pairs = matched_pairs
+        self.config = config
+        self.save_raw_csv = save_raw_csv
+        self.signals = WorkerSignals()
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    @pyqtSlot()
+    def run(self):
+        video_sessions = {k: v for k, v in self.matched_pairs.items() if v.get("video")}
+        total_sessions = len(video_sessions)
+        processed = 0
+        all_results = {}
+
+        for idx, (base, paths) in enumerate(video_sessions.items(), start=1):
+            if self._is_cancelled:
+                self.signals.progress.emit(
+                    processed,
+                    total_sessions,
+                    f"Tracking cancelled ({processed}/{total_sessions})."
+                )
+                break
+
+            vid_path = paths["video"]
+            ch_rois = paths.get("chamber_rois")
+
+            if not ch_rois:
+                cap = cv2.VideoCapture(vid_path)
+                ret, frame = cap.read()
+                cap.release()
+                if ret and frame is not None:
+                    configs = SymmetricGridAligner.generate_symmetric_chambers(
+                        frame_shape=frame.shape,
+                        rows=getattr(self.config, "grid_rows", 4),
+                        cols=getattr(self.config, "grid_cols", 2),
+                        order=getattr(self.config, "grid_order", "column_first"),
+                    )
+                    ch_rois = [c["roi"] for c in configs]
+                    paths["chamber_rois"] = ch_rois
+
+            out_dir = os.path.dirname(os.path.abspath(vid_path))
+            raw_csv_path = os.path.join(out_dir, f"{base}_raw.csv")
+
+            last_t = [time.time()]
+            last_f = [0]
+            current_fps = [0.0]
+
+            def on_frame_progress(f_cur: int, f_tot: int):
+                if self._is_cancelled:
+                    return
+
+                if f_tot > 0 and (f_cur % 15 == 0 or f_cur == f_tot):
+                    curr_t = time.time()
+                    dt = curr_t - last_t[0]
+                    df = f_cur - last_f[0]
+
+                    if dt >= 0.05 and df > 0:
+                        current_fps[0] = df / dt
+                        last_t[0] = curr_t
+                        last_f[0] = f_cur
+
+                    pct = min(100, max(0, int((f_cur / f_tot) * 100)))
+                    msg = (
+                        f"Tracking [{base}] ({idx}/{total_sessions}): "
+                        f"{pct}% ({f_cur}/{f_tot} frames) | {current_fps[0]:.1f} fps"
+                    )
+                    self.signals.progress.emit(processed, total_sessions, msg)
+
+            try:
+                tracker = FlyVisionTracker(chamber_rois=ch_rois)
+                raw_df = tracker.track_video(vid_path, progress_callback=on_frame_progress)
+
+                if self.save_raw_csv:
+                    raw_df.to_csv(raw_csv_path, index=False)
+                    paths["csv"] = raw_csv_path
+                else:
+                    paths["csv"] = None
+
+                all_results[base] = {
+                    "raw_csv": raw_csv_path if self.save_raw_csv else None,
+                    "frames": len(raw_df)
+                }
+                processed += 1
+                self.signals.session_finished.emit(base, all_results[base])
+                self.signals.progress.emit(
+                    processed,
+                    total_sessions,
+                    f"Finished video tracking: {base} ({processed}/{total_sessions})"
+                )
+            except Exception as e:
+                self.signals.error.emit(base, str(e))
+
+        self.signals.finished.emit(all_results)
+
+
+class PipelineBatchWorker(QRunnable):
+    def __init__(
+        self,
+        matched_pairs: Dict[str, dict],
+        config: PipelineConfig,
+        anesthesia_onset_time: float = 0.0,
+        save_raw_csv: bool = True,
+        save_cleaned_csv: bool = True,
+        plot_act_pos: bool = True,
+        plot_kymo: bool = True,
+        render_video_overlay: bool = False,
+    ):
+        super().__init__()
+        self.matched_pairs = matched_pairs
+        self.config = config
+        self.anesthesia_onset_time = anesthesia_onset_time
+        self.save_raw_csv = save_raw_csv
+        self.save_cleaned_csv = save_cleaned_csv
+        self.plot_act_pos = plot_act_pos
+        self.plot_kymo = plot_kymo
+        self.render_video_overlay = render_video_overlay
+        self.signals = WorkerSignals()
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    @pyqtSlot()
+    def run(self):
+        total_sessions = len(self.matched_pairs)
+        processed = 0
+        all_results = {}
+
+        cleaner = KinematicCleaner(fps=getattr(self.config, "fps", 30.0))
+        analyzer = AnesthesiaAnalyzer(
+            fps=getattr(self.config, "fps", 30.0),
+            anesthesia_still_sec=getattr(self.config, "anesthesia_still_sec", 120.0),
+            anesthesia_speed_thresh=getattr(self.config, "anesthesia_speed_thresh", 0.10),
+            sedate_speed_ratio=getattr(self.config, "sedate_speed_ratio", 0.35),
+            sedate_drop_speed=getattr(self.config, "sedate_drop_speed", 0.25),
+            anesthesia_onset_time=self.anesthesia_onset_time,
+        )
+        visualizer = ScientificVisualizer(fps=getattr(self.config, "fps", 30.0))
+
+        for idx, (base, paths) in enumerate(self.matched_pairs.items(), start=1):
+            if self._is_cancelled:
+                self.signals.progress.emit(
+                    processed,
+                    total_sessions,
+                    f"Task cancelled ({processed}/{total_sessions}).",
+                )
+                break
+
+            out_dir = os.path.dirname(os.path.abspath(paths.get("csv") or paths.get("video") or "."))
+            raw_csv = paths.get("csv")
+            vid_path = paths.get("video")
+
+            try:
+                if not raw_csv or not os.path.exists(raw_csv):
+                    if not vid_path or not os.path.exists(vid_path):
+                        raise FileNotFoundError(f"No valid video or CSV found for session '{base}'.")
+
+                    ch_rois = paths.get("chamber_rois")
+                    if not ch_rois:
+                        cap = cv2.VideoCapture(vid_path)
+                        ret, frame = cap.read()
+                        cap.release()
+                        if ret and frame is not None:
+                            configs = SymmetricGridAligner.generate_symmetric_chambers(
+                                frame_shape=frame.shape,
+                                rows=getattr(self.config, "grid_rows", 4),
+                                cols=getattr(self.config, "grid_cols", 2),
+                                order=getattr(self.config, "grid_order", "column_first"),
+                            )
+                            ch_rois = [c["roi"] for c in configs]
+                            paths["chamber_rois"] = ch_rois
+
+                    last_t = [time.time()]
+                    last_f = [0]
+                    current_fps = [0.0]
+
+                    def on_tracking_progress(f_cur: int, f_tot: int):
+                        if self._is_cancelled:
+                            return
+                        if f_tot > 0 and (f_cur % 15 == 0 or f_cur == f_tot):
+                            curr_t = time.time()
+                            dt = curr_t - last_t[0]
+                            df = f_cur - last_f[0]
+                            if dt >= 0.05 and df > 0:
+                                current_fps[0] = df / dt
+                                last_t[0] = curr_t
+                                last_f[0] = f_cur
+                            pct = min(100, max(0, int((f_cur / f_tot) * 100)))
+                            msg = (
+                                f"Tracking [{base}] ({idx}/{total_sessions}): "
+                                f"{pct}% ({f_cur}/{f_tot} frames) | {current_fps[0]:.1f} fps"
+                            )
+                            self.signals.progress.emit(processed, total_sessions, msg)
+
+                    tracker = FlyVisionTracker(chamber_rois=ch_rois)
+                    raw_df = tracker.track_video(vid_path, progress_callback=on_tracking_progress)
+
+                    if self.save_raw_csv:
+                        raw_csv = os.path.join(out_dir, f"{base}_raw.csv")
+                        raw_df.to_csv(raw_csv, index=False)
+                        paths["csv"] = raw_csv
+                else:
+                    self.signals.progress.emit(
+                        processed,
+                        total_sessions,
+                        f"[{SessionPhase.READING_CSV.value}] {base}...",
+                    )
+                    raw_df = pd.read_csv(raw_csv)
+
+                if self._is_cancelled:
+                    break
+
+                self.signals.progress.emit(
+                    processed,
+                    total_sessions,
+                    f"[{SessionPhase.CLEANING.value}] {base}...",
+                )
+                cleaned_df = cleaner.clean_trajectory(raw_df)
+                cleaned_csv_path = os.path.join(out_dir, f"{base}_cleaned.csv")
+                if self.save_cleaned_csv:
+                    cleaned_df.to_csv(cleaned_csv_path, index=False)
+
+                if self._is_cancelled:
+                    break
+
+                plot_files = {}
+                if self.plot_act_pos or self.plot_kymo:
+                    self.signals.progress.emit(
+                        processed,
+                        total_sessions,
+                        f"[{SessionPhase.PLOTTING_EARLY.value}] {base}...",
+                    )
+                    if self.plot_act_pos:
+                        act_pos_path = os.path.join(out_dir, f"{base}_activity_position.png")
+                        visualizer.plot_activity_position_overview(cleaned_df, act_pos_path)
+                        plot_files["act_pos"] = act_pos_path
+
+                    if self.plot_kymo:
+                        kymo_path = os.path.join(out_dir, f"{base}_kymograph_norm.png")
+                        visualizer.plot_kymograph_hexbin(cleaned_df, kymo_path)
+                        plot_files["kymo"] = kymo_path
+
+                if self._is_cancelled:
+                    break
+
+                self.signals.progress.emit(
+                    processed,
+                    total_sessions,
+                    f"[{SessionPhase.ANALYZING.value}] {base}...",
+                )
+                try:
+                    df_with_states = analyzer.evaluate_states(
+                        cleaned_df,
+                        anesthesia_onset_time=self.anesthesia_onset_time,
+                    )
+                except TypeError:
+                    df_with_states = analyzer.evaluate_states(cleaned_df)
+
+                try:
+                    summary_df = analyzer.extract_summary(
+                        df_with_states,
+                        anesthesia_onset_time=self.anesthesia_onset_time,
+                    )
+                except TypeError:
+                    summary_df = analyzer.extract_summary(df_with_states)
+
+                summary_csv_path = os.path.join(out_dir, f"{base}_summary.csv")
+                summary_df.to_csv(summary_csv_path, index=False)
+
+                if self._is_cancelled:
+                    break
+
+                overlay_path = None
+                if self.render_video_overlay and vid_path and os.path.exists(vid_path):
+                    self.signals.progress.emit(
+                        processed,
+                        total_sessions,
+                        f"[{SessionPhase.RENDERING.value}] {base}...",
+                    )
+                    overlay_path = os.path.join(out_dir, f"{base}_overlay.mp4")
+                    visualizer.render_overlay_video(df_with_states, vid_path, overlay_path)
+
+                session_res = {
+                    "cleaned_csv": cleaned_csv_path if self.save_cleaned_csv else None,
+                    "summary_csv": summary_csv_path,
+                    "plots": plot_files,
+                    "overlay_video": overlay_path,
+                    "summary_data": summary_df.to_dict(orient="records") if hasattr(summary_df, "to_dict") else None,
+                }
+                all_results[base] = session_res
+                processed += 1
+                self.signals.session_finished.emit(base, session_res)
+                self.signals.progress.emit(
+                    processed,
+                    total_sessions,
+                    f"[{SessionPhase.COMPLETED.value}] {base} ({processed}/{total_sessions})",
+                )
+
+            except Exception as e:
+                self.signals.error.emit(base, str(e))
+                self.signals.progress.emit(
+                    processed,
+                    total_sessions,
+                    f"[{SessionPhase.FAILED.value}] Error on {base}",
+                )
+
+        self.signals.finished.emit(all_results)
+
+
+# =====================================================================
+# Interactive Multi-Chamber Calibration Canvas
 # =====================================================================
 class InteractiveChamberCanvas(QWidget):
     chamberSelected = pyqtSignal(int)
     firstRoiDrawn = pyqtSignal(tuple)
     boxChanged = pyqtSignal()
-    selectionChanged = pyqtSignal(int)  # 传递当前选中的数量
+    selectionChanged = pyqtSignal(int)
 
     MIN_WIDTH = 25
     MIN_HEIGHT = 15
@@ -108,25 +491,22 @@ class InteractiveChamberCanvas(QWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.sample_frame = None
+        self.cached_gray = None
+        self.cached_qimage_base = None
         self.boxes: List[List[int]] = []
 
-        # 撤销历史栈
         self.undo_stack: List[Tuple[List[List[int]], set, int]] = []
-        self.max_undo = 30
+        self.max_undo = 50
 
-        # 选中状态管理：默认单选
         self.selected_idx = -1
-        self.selected_indices = set()
+        self.selected_indices: set = set()
 
-        # 默认模式改为 "single"
-        self.link_mode = "single"  # "single", "col", "row", "all" (表示所有选中)
+        self.link_mode = "single"
         self.rows = 4
         self.cols = 2
-        self.show_mask = False
         self.diff_thresh = 14
         self.fly_centroids: Dict[int, Optional[Tuple[float, float]]] = {}
 
-        # 绘制与框选状态
         self.is_drawing_first = False
         self.draw_start_point = None
         self.current_drawing_rect = None
@@ -136,29 +516,26 @@ class InteractiveChamberCanvas(QWidget):
         self.current_select_rect_img = None
         self.press_pos = None
 
-        # 拖拽与缩放状态
         self.drag_mode = None
         self.drag_start_pos = None
-        self.drag_initial_boxes = []
+        self.drag_initial_boxes: List[List[int]] = []
 
         self.setStyleSheet("background-color: #0F172A; border-radius: 8px;")
         self.setMinimumSize(720, 480)
 
     def _push_undo(self):
-        """保存当前 boxes 副本与选择状态到撤销栈"""
         state = ([list(b) for b in self.boxes], set(self.selected_indices), self.selected_idx)
         self.undo_stack.append(state)
         if len(self.undo_stack) > self.max_undo:
             self.undo_stack.pop(0)
 
     def undo(self):
-        """撤销到上一步"""
         if not self.undo_stack:
             return
         boxes_prev, indices_prev, idx_prev = self.undo_stack.pop()
         self.boxes = [list(b) for b in boxes_prev]
         self.selected_indices = set(indices_prev)
-        self.selected_idx = idx_prev
+        self.selected_idx = idx_prev if (0 <= idx_prev < len(self.boxes)) else (-1 if not self.boxes else 0)
         self._update_fly_detections()
         self.selectionChanged.emit(len(self.selected_indices))
         self.boxChanged.emit()
@@ -166,13 +543,20 @@ class InteractiveChamberCanvas(QWidget):
 
     def set_data(self, frame: np.ndarray, boxes: List[List[int]], rows: int = 4, cols: int = 2):
         self.sample_frame = frame
+        self.cached_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame is not None else None
+        self.cached_qimage_base = None
+
+        if self.sample_frame is not None:
+            rgb_base = np.ascontiguousarray(cv2.cvtColor(self.sample_frame, cv2.COLOR_BGR2RGB))
+            h, w, ch = rgb_base.shape
+            self.cached_qimage_base = QImage(rgb_base.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
+
         self.boxes = [list(b) for b in boxes]
         self.rows = rows
         self.cols = cols
         self.is_drawing_first = (len(self.boxes) == 0)
         self.undo_stack.clear()
-        
-        # 默认选中第 1 个 chamber
+
         if self.boxes:
             self.selected_idx = 0
             self.selected_indices = {0}
@@ -196,10 +580,10 @@ class InteractiveChamberCanvas(QWidget):
     def _update_fly_detections(self):
         if self.sample_frame is None or not self.boxes:
             return
-        gray = cv2.cvtColor(self.sample_frame, cv2.COLOR_BGR2GRAY)
+        gray = self.cached_gray if self.cached_gray is not None else cv2.cvtColor(self.sample_frame, cv2.COLOR_BGR2GRAY)
         tracker = RobustFlyTracker(
             chamber_rois=[tuple(b) for b in self.boxes],
-            diff_thresh=self.diff_thresh
+            diff_thresh=self.diff_thresh,
         )
         _, detections = tracker.process_frame(gray, 0, 0.0)
         tracker.close()
@@ -236,10 +620,8 @@ class InteractiveChamberCanvas(QWidget):
         if self.is_drawing_first or not self.boxes:
             return None, -1
 
-        # 适当扩大手柄触控范围至 10px，避免鼠标难以精准对准
         handle_hit_margin = 10.0
 
-        # 1. 优先判定当前主选中 Chamber 的 8 个调节手柄
         if 0 <= self.selected_idx < len(self.boxes):
             bx1, by1, bx2, by2 = self.boxes[self.selected_idx]
             rx1, ry1 = self.img_to_canvas(bx1, by1)
@@ -253,19 +635,15 @@ class InteractiveChamberCanvas(QWidget):
             in_y_range = (ry1 - handle_hit_margin <= cy <= ry2 + handle_hit_margin)
             in_x_range = (rx1 - handle_hit_margin <= cx <= rx2 + handle_hit_margin)
 
-            # 四角手柄
             if near_l and near_t: return "resize_tl", self.selected_idx
             if near_r and near_t: return "resize_tr", self.selected_idx
             if near_l and near_b: return "resize_bl", self.selected_idx
             if near_r and near_b: return "resize_br", self.selected_idx
-            
-            # 四边手柄
             if near_l and in_y_range: return "resize_l", self.selected_idx
             if near_r and in_y_range: return "resize_r", self.selected_idx
             if near_t and in_x_range: return "resize_t", self.selected_idx
             if near_b and in_x_range: return "resize_b", self.selected_idx
 
-        # 2. 检查是否点击在任何 Chamber 内部（用于移动）
         for idx, (x1, y1, x2, y2) in enumerate(self.boxes):
             kx1, ky1 = self.img_to_canvas(x1, y1)
             kx2, ky2 = self.img_to_canvas(x2, y2)
@@ -274,128 +652,13 @@ class InteractiveChamberCanvas(QWidget):
 
         return None, -1
 
-    def mouseMoveEvent(self, event):
-        cx, cy = event.position().x(), event.position().y()
-
-        # 1. 首次绘制模式
-        if self.is_drawing_first and self.draw_start_point:
-            ix, iy = self.canvas_to_img(cx, cy)
-            sx, sy = self.draw_start_point
-            self.current_drawing_rect = (min(sx, ix), min(sy, iy), max(sx, ix), max(sy, iy))
-            self.update()
-            return
-
-        # 2. 空白处框选移动
-        if self.is_box_selecting and self.select_start_img:
-            ix, iy = self.canvas_to_img(cx, cy)
-            sx, sy = self.select_start_img
-            self.current_select_rect_img = (min(sx, ix), min(sy, iy), max(sx, ix), max(sy, iy))
-            self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
-            self.update()
-            return
-
-        # 3. 拖拽移动与边缘拉伸
-        if self.drag_mode and self.drag_start_pos:
-            s, _, _ = self.get_scale_and_offsets()
-            dx = (cx - self.drag_start_pos[0]) / s
-            dy = (cy - self.drag_start_pos[1]) / s
-            img_h, img_w = self.sample_frame.shape[:2] if self.sample_frame is not None else (1000, 1000)
-
-            if not self.selected_indices:
-                self.selected_indices = {self.selected_idx} if self.selected_idx >= 0 else {0}
-                if self.selected_idx < 0:
-                    self.selected_idx = 0
-                self.selectionChanged.emit(len(self.selected_indices))
-
-            sel_row = self.selected_idx % self.rows
-            sel_col = self.selected_idx // self.rows
-
-            # 先克隆一份临时候选数据预演移动/拉伸
-            tentative_boxes = [list(b) for b in self.boxes]
-
-            for idx in range(len(self.boxes)):
-                apply = False
-                cur_row = idx % self.rows
-                cur_col = idx // self.rows
-
-                if len(self.selected_indices) > 1:
-                    apply = (idx in self.selected_indices)
-                else:
-                    if self.link_mode == "all":
-                        apply = (idx in self.selected_indices)
-                    elif self.link_mode == "col" and cur_col == sel_col:
-                        apply = True
-                    elif self.link_mode == "row" and cur_row == sel_row:
-                        apply = True
-                    elif self.link_mode == "single":
-                        apply = (idx in self.selected_indices or idx == self.selected_idx)
-
-                if apply:
-                    ox1, oy1, ox2, oy2 = self.drag_initial_boxes[idx]
-                    nx1, ny1, nx2, ny2 = ox1, oy1, ox2, oy2
-
-                    if self.drag_mode == "move":
-                        nx1, ny1 = ox1 + dx, oy1 + dy
-                        nx2, ny2 = ox2 + dx, oy2 + dy
-                    else:
-                        # 边角手柄拉伸计算
-                        if "resize_l" in self.drag_mode or self.drag_mode in ("resize_tl", "resize_bl"):
-                            nx1 = min(ox2 - self.MIN_WIDTH, ox1 + dx)
-                        if "resize_r" in self.drag_mode or self.drag_mode in ("resize_tr", "resize_br"):
-                            nx2 = max(ox1 + self.MIN_WIDTH, ox2 + dx)
-                        if "resize_t" in self.drag_mode or self.drag_mode in ("resize_tl", "resize_tr"):
-                            ny1 = min(oy2 - self.MIN_HEIGHT, oy1 + dy)
-                        if "resize_b" in self.drag_mode or self.drag_mode in ("resize_bl", "resize_br"):
-                            ny2 = max(oy1 + self.MIN_HEIGHT, oy2 + dy)
-
-                    tentative_boxes[idx][0] = int(np.clip(nx1, 0, img_w - self.MIN_WIDTH))
-                    tentative_boxes[idx][1] = int(np.clip(ny1, 0, img_h - self.MIN_HEIGHT))
-                    tentative_boxes[idx][2] = int(np.clip(nx2, self.MIN_WIDTH, img_w))
-                    tentative_boxes[idx][3] = int(np.clip(ny2, self.MIN_HEIGHT, img_h))
-
-            # 优化碰撞检查：允许贴合，仅当被修改的 box 发生实质性侵入穿透时才阻断
-            can_apply = True
-            for idx in range(len(self.boxes)):
-                # 如果这个 box 根本没参与本次拖动变形，跳过检测
-                if tentative_boxes[idx] == self.drag_initial_boxes[idx]:
-                    continue
-                # 与其他 box 进行碰撞检测
-                for other_idx in range(len(self.boxes)):
-                    if idx == other_idx:
-                        continue
-                    # 容许 2px 的边界重叠误差，防止相邻边缘直接把拉伸卡死
-                    if self._is_intersecting(tentative_boxes[idx], tentative_boxes[other_idx], margin=2):
-                        can_apply = False
-                        break
-                if not can_apply:
-                    break
-
-            if can_apply:
-                self.boxes = tentative_boxes
-                self.boxChanged.emit()
-                self.update()
-        else:
-            action, _ = self._hit_test(cx, cy)
-            cursor_map = {
-                "resize_l": Qt.CursorShape.SizeHorCursor,
-                "resize_r": Qt.CursorShape.SizeHorCursor,
-                "resize_t": Qt.CursorShape.SizeVerCursor,
-                "resize_b": Qt.CursorShape.SizeVerCursor,
-                "resize_tl": Qt.CursorShape.SizeFDiagCursor,
-                "resize_br": Qt.CursorShape.SizeFDiagCursor,
-                "resize_tr": Qt.CursorShape.SizeBDiagCursor,
-                "resize_bl": Qt.CursorShape.SizeBDiagCursor,
-                "move": Qt.CursorShape.SizeAllCursor,
-            }
-            self.setCursor(QCursor(cursor_map.get(action, Qt.CursorShape.ArrowCursor)))
-
     def mousePressEvent(self, event):
         self.setFocus()
         if event.button() == Qt.MouseButton.LeftButton:
             cx, cy = event.position().x(), event.position().y()
             self.press_pos = (cx, cy)
             modifiers = event.modifiers()
-            has_modifier = bool(modifiers & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier))
+            has_shift = bool(modifiers & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier))
 
             if self.is_drawing_first:
                 ix, iy = self.canvas_to_img(cx, cy)
@@ -407,7 +670,10 @@ class InteractiveChamberCanvas(QWidget):
             action, idx = self._hit_test(cx, cy)
 
             if action is None:
-                # 点击在 Chamber 外部：准备橡皮筋框选
+                if not has_shift:
+                    self.selected_indices.clear()
+                    self.selected_idx = -1
+                    self.selectionChanged.emit(0)
                 ix, iy = self.canvas_to_img(cx, cy)
                 self.is_box_selecting = True
                 self.select_start_img = (ix, iy)
@@ -415,10 +681,8 @@ class InteractiveChamberCanvas(QWidget):
                 self.update()
                 return
 
-            # 点击了手柄或内部
             if action == "move":
-                if has_modifier:
-                    # Shift/Ctrl 加选 / 减选
+                if has_shift:
                     if idx in self.selected_indices:
                         self.selected_indices.remove(idx)
                         self.selected_idx = next(iter(self.selected_indices)) if self.selected_indices else -1
@@ -426,7 +690,6 @@ class InteractiveChamberCanvas(QWidget):
                         self.selected_indices.add(idx)
                         self.selected_idx = idx
                 else:
-                    # 若点击的项未在当前多选组内，则重置为仅单选该项
                     if idx not in self.selected_indices:
                         self.selected_indices = {idx}
                         self.selected_idx = idx
@@ -445,8 +708,123 @@ class InteractiveChamberCanvas(QWidget):
             self.drag_initial_boxes = [list(b) for b in self.boxes]
             self.update()
 
+    def mouseMoveEvent(self, event):
+        cx, cy = event.position().x(), event.position().y()
+
+        if self.is_drawing_first and self.draw_start_point:
+            ix, iy = self.canvas_to_img(cx, cy)
+            sx, sy = self.draw_start_point
+            self.current_drawing_rect = (min(sx, ix), min(sy, iy), max(sx, ix), max(sy, iy))
+            self.update()
+            return
+
+        if self.is_box_selecting and self.select_start_img:
+            ix, iy = self.canvas_to_img(cx, cy)
+            sx, sy = self.select_start_img
+            self.current_select_rect_img = (min(sx, ix), min(sy, iy), max(sx, ix), max(sy, iy))
+            self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
+            self.update()
+            return
+
+        if self.drag_mode and self.drag_start_pos:
+            s, _, _ = self.get_scale_and_offsets()
+            raw_dx = (cx - self.drag_start_pos[0]) / s
+            raw_dy = (cy - self.drag_start_pos[1]) / s
+            img_h, img_w = self.sample_frame.shape[:2] if self.sample_frame is not None else (1000, 1000)
+
+            active_set = set(self.selected_indices)
+            if self.selected_idx >= 0:
+                active_set.add(self.selected_idx)
+            if not active_set:
+                active_set = {0}
+
+            sel_row = self.selected_idx % self.rows if self.selected_idx >= 0 else 0
+            sel_col = self.selected_idx // self.rows if self.selected_idx >= 0 else 0
+
+            if len(self.selected_indices) <= 1:
+                if self.link_mode == "col":
+                    active_set = {i for i in range(len(self.boxes)) if (i // self.rows) == sel_col}
+                elif self.link_mode == "row":
+                    active_set = {i for i in range(len(self.boxes)) if (i % self.rows) == sel_row}
+                elif self.link_mode == "all":
+                    active_set = set(range(len(self.boxes)))
+
+            tentative_boxes = [list(b) for b in self.boxes]
+
+            if self.drag_mode == "move":
+                min_allow_dx = max([-self.drag_initial_boxes[idx][0] for idx in active_set])
+                max_allow_dx = min([img_w - self.drag_initial_boxes[idx][2] for idx in active_set])
+                min_allow_dy = max([-self.drag_initial_boxes[idx][1] for idx in active_set])
+                max_allow_dy = min([img_h - self.drag_initial_boxes[idx][3] for idx in active_set])
+
+                if min_allow_dx > max_allow_dx:
+                    min_allow_dx, max_allow_dx = max_allow_dx, min_allow_dx
+                if min_allow_dy > max_allow_dy:
+                    min_allow_dy, max_allow_dy = max_allow_dy, min_allow_dy
+
+                rigid_dx = np.clip(raw_dx, min_allow_dx, max_allow_dx)
+                rigid_dy = np.clip(raw_dy, min_allow_dy, max_allow_dy)
+
+                for idx in active_set:
+                    ox1, oy1, ox2, oy2 = self.drag_initial_boxes[idx]
+                    tentative_boxes[idx] = [
+                        int(round(ox1 + rigid_dx)),
+                        int(round(oy1 + rigid_dy)),
+                        int(round(ox2 + rigid_dx)),
+                        int(round(oy2 + rigid_dy))
+                    ]
+            else:
+                target_resize_set = active_set if (self.link_mode != "single" or len(self.selected_indices) > 1) else {self.selected_idx}
+                for idx in target_resize_set:
+                    ox1, oy1, ox2, oy2 = self.drag_initial_boxes[idx]
+                    nx1, ny1, nx2, ny2 = ox1, oy1, ox2, oy2
+
+                    if "resize_l" in self.drag_mode or self.drag_mode in ("resize_tl", "resize_bl"):
+                        nx1 = min(ox2 - self.MIN_WIDTH, ox1 + raw_dx)
+                    if "resize_r" in self.drag_mode or self.drag_mode in ("resize_tr", "resize_br"):
+                        nx2 = max(ox1 + self.MIN_WIDTH, ox2 + raw_dx)
+                    if "resize_t" in self.drag_mode or self.drag_mode in ("resize_tl", "resize_tr"):
+                        ny1 = min(oy2 - self.MIN_HEIGHT, oy1 + raw_dy)
+                    if "resize_b" in self.drag_mode or self.drag_mode in ("resize_bl", "resize_br"):
+                        ny2 = max(oy1 + self.MIN_HEIGHT, oy2 + raw_dy)
+
+                    nx1 = int(np.clip(nx1, 0, img_w - self.MIN_WIDTH))
+                    nx2 = int(np.clip(nx2, self.MIN_WIDTH, img_w))
+                    if nx2 - nx1 < self.MIN_WIDTH:
+                        if "resize_l" in self.drag_mode:
+                            nx1 = nx2 - self.MIN_WIDTH
+                        else:
+                            nx2 = nx1 + self.MIN_WIDTH
+
+                    ny1 = int(np.clip(ny1, 0, img_h - self.MIN_HEIGHT))
+                    ny2 = int(np.clip(ny2, self.MIN_HEIGHT, img_h))
+                    if ny2 - ny1 < self.MIN_HEIGHT:
+                        if "resize_t" in self.drag_mode:
+                            ny1 = ny2 - self.MIN_HEIGHT
+                        else:
+                            ny2 = ny1 + self.MIN_HEIGHT
+
+                    tentative_boxes[idx] = [nx1, ny1, nx2, ny2]
+
+            self.boxes = tentative_boxes
+            self.boxChanged.emit()
+            self.update()
+        else:
+            action, _ = self._hit_test(cx, cy)
+            cursor_map = {
+                "resize_l": Qt.CursorShape.SizeHorCursor,
+                "resize_r": Qt.CursorShape.SizeHorCursor,
+                "resize_t": Qt.CursorShape.SizeVerCursor,
+                "resize_b": Qt.CursorShape.SizeVerCursor,
+                "resize_tl": Qt.CursorShape.SizeFDiagCursor,
+                "resize_br": Qt.CursorShape.SizeFDiagCursor,
+                "resize_tr": Qt.CursorShape.SizeBDiagCursor,
+                "resize_bl": Qt.CursorShape.SizeBDiagCursor,
+                "move": Qt.CursorShape.SizeAllCursor,
+            }
+            self.setCursor(QCursor(cursor_map.get(action, Qt.CursorShape.ArrowCursor)))
+
     def mouseReleaseEvent(self, event):
-        # 1. 首次手工拉框
         if self.is_drawing_first and self.current_drawing_rect:
             x1, y1, x2, y2 = self.current_drawing_rect
             if (x2 - x1) >= self.MIN_WIDTH and (y2 - y1) >= self.MIN_HEIGHT:
@@ -461,29 +839,18 @@ class InteractiveChamberCanvas(QWidget):
                 self.update()
             return
 
-        # 2. 外部框选或单击 Chamber 外取消选择
         if self.is_box_selecting:
-            cx, cy = event.position().x(), event.position().y()
-            is_click = self.press_pos and (abs(cx - self.press_pos[0]) < 4 and abs(cy - self.press_pos[1]) < 4)
-
-            if is_click:
-                # 选定 chamber 时，单击 chamber 外直接取消选择
-                modifiers = event.modifiers()
-                has_modifier = bool(modifiers & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier))
-                if not has_modifier:
-                    self.selected_indices.clear()
-                    self.selected_idx = -1
-                    self.selectionChanged.emit(0)
-            elif self.current_select_rect_img:
+            if self.current_select_rect_img:
                 rx1, ry1, rx2, ry2 = self.current_select_rect_img
-                if (rx2 - rx1) > 5 and (ry2 - ry1) > 5:
+                if (rx2 - rx1) > 6 and (ry2 - ry1) > 6:
                     hit_set = set()
                     for idx, (bx1, by1, bx2, by2) in enumerate(self.boxes):
                         if not (bx2 < rx1 or bx1 > rx2 or by2 < ry1 or by1 > ry2):
                             hit_set.add(idx)
 
                     modifiers = event.modifiers()
-                    if modifiers & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier):
+                    has_shift = bool(modifiers & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier))
+                    if has_shift:
                         self.selected_indices.update(hit_set)
                     else:
                         self.selected_indices = hit_set
@@ -501,10 +868,8 @@ class InteractiveChamberCanvas(QWidget):
             self.update()
             return
 
-        # 3. 拖拽变形结束：推入撤销栈
         if self.drag_mode:
             if self.drag_initial_boxes != self.boxes:
-                # 将初始状态作为撤销点推入栈
                 state = ([list(b) for b in self.drag_initial_boxes], set(self.selected_indices), self.selected_idx)
                 self.undo_stack.append(state)
                 if len(self.undo_stack) > self.max_undo:
@@ -524,11 +889,6 @@ class InteractiveChamberCanvas(QWidget):
             super().keyPressEvent(event)
             return
 
-        if not self.selected_indices:
-            self.selected_indices = set(range(len(self.boxes)))
-            self.selected_idx = 0
-            self.selectionChanged.emit(len(self.selected_indices))
-
         step = 5 if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier) else 1
         dx, dy = 0, 0
 
@@ -541,29 +901,26 @@ class InteractiveChamberCanvas(QWidget):
             super().keyPressEvent(event)
             return
 
+        self._push_undo()
+        active_set = self.selected_indices if self.selected_indices else ({self.selected_idx} if self.selected_idx >= 0 else set(range(len(self.boxes))))
         img_h, img_w = self.sample_frame.shape[:2] if self.sample_frame is not None else (1000, 1000)
-        tentative_boxes = [list(b) for b in self.boxes]
 
-        for idx in list(self.selected_indices):
-            x1, y1, x2, y2 = tentative_boxes[idx]
+        for idx in active_set:
+            x1, y1, x2, y2 = self.boxes[idx]
             w, h = x2 - x1, y2 - y1
-            nx1 = np.clip(x1 + dx, 0, img_w - w)
-            ny1 = np.clip(y1 + dy, 0, img_h - h)
-            tentative_boxes[idx] = [int(nx1), int(ny1), int(nx1 + w), int(ny1 + h)]
+            nx1 = int(np.clip(x1 + dx, 0, img_w - w))
+            ny1 = int(np.clip(y1 + dy, 0, img_h - h))
+            self.boxes[idx] = [nx1, ny1, nx1 + w, ny1 + h]
 
-        # 碰撞校验：无重合才真正保存并生效
-        if not self._has_any_overlap(tentative_boxes):
-            self._push_undo()
-            self.boxes = tentative_boxes
-            self.boxChanged.emit()
-            self._update_fly_detections()
-            self.update()
+        self.boxChanged.emit()
+        self._update_fly_detections()
+        self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        if self.sample_frame is None:
+        if self.sample_frame is None or self.cached_qimage_base is None:
             painter.setPen(QColor("#64748B"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No video frame available")
             return
@@ -571,36 +928,12 @@ class InteractiveChamberCanvas(QWidget):
         s, ox, oy = self.get_scale_and_offsets()
         img_h, img_w = self.sample_frame.shape[:2]
 
-        if self.show_mask:
-            gray = cv2.cvtColor(self.sample_frame, cv2.COLOR_BGR2GRAY)
-            inv = cv2.bitwise_not(gray)
-            kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-            kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
-            bh_s = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel_small)
-            bh_l = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel_large)
-            energy = cv2.addWeighted(bh_s, 0.6, bh_l, 0.4, 0)
-            energy = cv2.addWeighted(energy, 0.7, inv, 0.3, 0)
-            clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8))
-            enhanced = clahe.apply(energy)
-            norm_energy = cv2.normalize(enhanced, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
-            _, thresh_mask = cv2.threshold(norm_energy, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            boosted = cv2.addWeighted(norm_energy, 0.7, thresh_mask, 0.3, 0)
-            vis = cv2.applyColorMap(boosted, cv2.COLORMAP_JET)
-        else:
-            vis = self.sample_frame.copy()
+        painter.drawImage(QRectF(ox, oy, img_w * s, img_h * s), self.cached_qimage_base)
 
-        rgb_frame = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_frame.shape
-        bytes_per_line = ch * w
-        qimg = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-        painter.drawImage(QRectF(ox, oy, w * s, h * s), qimg)
-
-        # 中轴参考线
         mid_x = ox + (img_w * 0.5) * s
         painter.setPen(QPen(QColor("#94A3B8"), 1, Qt.PenStyle.DashLine))
         painter.drawLine(int(mid_x), int(oy), int(mid_x), int(oy + img_h * s))
 
-        # 首次绘制引导
         if self.is_drawing_first and self.current_drawing_rect:
             x1, y1, x2, y2 = self.current_drawing_rect
             rx1, ry1 = self.img_to_canvas(x1, y1)
@@ -610,13 +943,12 @@ class InteractiveChamberCanvas(QWidget):
             painter.drawRect(QRectF(rx1, ry1, rx2 - rx1, ry2 - ry1))
             painter.setPen(QColor("#FDE68A"))
             painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
-            painter.drawText(int(rx1 + 6), int(ry1 + 18), "CH 1 (Release mouse to infer grid)")
+            painter.drawText(int(rx1 + 6), int(ry1 + 18), "CH 1 (Release to infer grid)")
             return
 
         font_label = QFont("Arial", 9, QFont.Weight.Bold)
         font_dim = QFont("Arial", 8)
 
-        # 绘制所有 Chamber
         for idx, (x1, y1, x2, y2) in enumerate(self.boxes):
             cid = idx + 1
             is_active = (idx == self.selected_idx)
@@ -628,11 +960,11 @@ class InteractiveChamberCanvas(QWidget):
 
             if is_active:
                 border_color = QColor("#F59E0B")
-                fill_color = QColor(245, 158, 11, 35)
+                fill_color = QColor(245, 158, 11, 40)
                 line_w = 2.5
             elif is_in_group:
                 border_color = QColor("#38BDF8")
-                fill_color = QColor(56, 189, 248, 25)
+                fill_color = QColor(56, 189, 248, 30)
                 line_w = 2.0
             else:
                 border_color = QColor("#10B981")
@@ -643,13 +975,11 @@ class InteractiveChamberCanvas(QWidget):
             painter.setBrush(QBrush(fill_color))
             painter.drawRoundedRect(QRectF(rx1, ry1, rw, rh), 4, 4)
 
-            # 内边缘标线
             painter.setPen(QPen(QColor("#F97316"), 1, Qt.PenStyle.DotLine))
             painter.drawLine(int(rx1 + rw * 0.08), int(ry1), int(rx1 + rw * 0.08), int(ry2))
             painter.setPen(QPen(QColor("#38BDF8"), 1, Qt.PenStyle.DotLine))
             painter.drawLine(int(rx2 - rw * 0.08), int(ry1), int(rx2 - rw * 0.08), int(ry2))
 
-            # ID Badge
             tag_rect = QRectF(rx1 + 4, ry1 + 4, 48, 18)
             painter.setPen(Qt.PenStyle.NoPen)
             badge_bg = QColor("#D97706") if is_active else (QColor("#0284C7") if is_in_group else QColor("#0F172A"))
@@ -665,7 +995,6 @@ class InteractiveChamberCanvas(QWidget):
                 painter.setPen(QColor("#FDE68A"))
                 painter.drawText(int(rx1 + 56), int(ry1 + 17), f"{int(x2 - x1)}x{int(y2 - y1)} px")
 
-            # 十字质心
             if cid in self.fly_centroids and self.fly_centroids[cid] is not None:
                 fx, fy = self.fly_centroids[cid]
                 cfx, cfy = self.img_to_canvas(fx, fy)
@@ -676,7 +1005,6 @@ class InteractiveChamberCanvas(QWidget):
                 painter.setBrush(QBrush(QColor("#EF4444")))
                 painter.drawEllipse(QPointF(cfx, cfy), 3.5, 3.5)
 
-            # 仅在当前主活跃项上绘制拉伸手柄
             if is_active:
                 h_size = 7
                 painter.setBrush(QBrush(QColor("#FFFFFF")))
@@ -689,7 +1017,6 @@ class InteractiveChamberCanvas(QWidget):
                 for px, py in handle_points:
                     painter.drawRect(QRectF(px - h_size / 2, py - h_size / 2, h_size, h_size))
 
-        # 框选矩形
         if self.is_box_selecting and self.current_select_rect_img:
             x1, y1, x2, y2 = self.current_select_rect_img
             rx1, ry1 = self.img_to_canvas(x1, y1)
@@ -698,53 +1025,45 @@ class InteractiveChamberCanvas(QWidget):
             painter.setBrush(QBrush(QColor(56, 189, 248, 45)))
             painter.drawRect(QRectF(rx1, ry1, rx2 - rx1, ry2 - ry1))
 
-    @staticmethod
-    def _is_intersecting(box_a: List[int], box_b: List[int], margin: int = 1) -> bool:
-        """矩形 AABB 相交判断（支持容差 margin，避免相邻试管贴合时误判碰撞）"""
-        ax1, ay1, ax2, ay2 = box_a
-        bx1, by1, bx2, by2 = box_b
-        # 若存在任意一条轴分离（计入 margin 容差），则不相交
-        if (ax2 - margin) <= (bx1 + margin) or (ax1 + margin) >= (bx2 - margin) or \
-           (ay2 - margin) <= (by1 + margin) or (ay1 + margin) >= (by2 - margin):
-            return False
-        return True
 
-    def _has_any_overlap(self, candidate_boxes: List[List[int]], margin: int = 1) -> bool:
-        """检查整组 boxes 内部是否存在任意两两实质性重合"""
-        n = len(candidate_boxes)
-        for i in range(n):
-            for j in range(i + 1, n):
-                if self._is_intersecting(candidate_boxes[i], candidate_boxes[j], margin=margin):
-                    return True
-        return False
-
-
+# =====================================================================
+# Chamber Calibration Dialog
+# =====================================================================
 class ChamberCalibrationDialog(QDialog):
-    """
-    Interactive Multi-Chamber Grid Calibration Dialog:
-    Supports manual first ROI inference, 8-way handle stretching, link modes, and auto-snap.
-    """
     def __init__(self, video_path: str, parent=None, initial_chambers=None, rows: int = 4, cols: int = 2, order: str = "column_first"):
         super().__init__(parent)
         self.setWindowTitle(f"Multi-Chamber Grid Calibrator - {os.path.basename(video_path)}")
-        self.resize(1120, 720)
+        self.resize(1140, 740)
         self.video_path = video_path
         self.sample_frame = None
-        self.rows = max(1, rows)
-        self.cols = max(1, cols)
         self.order = order
         self.last_first_box = None
+
+        if initial_chambers and len(initial_chambers) > 0:
+            self.boxes = [list(b) for b in initial_chambers]
+            self.last_first_box = tuple(self.boxes[0])
+            if len(self.boxes) != (rows * cols):
+                self.rows = rows
+                self.cols = max(1, len(self.boxes) // rows)
+            else:
+                self.rows = rows
+                self.cols = cols
+        else:
+            self.boxes = []
+            self.rows = max(1, rows)
+            self.cols = max(1, cols)
 
         self._load_video_sample()
         self._setup_ui()
 
-        if initial_chambers and len(initial_chambers) == (self.rows * self.cols):
-            self.boxes = [list(b) for b in initial_chambers]
-            self.last_first_box = tuple(self.boxes[0])
+        self.undo_shortcut = QShortcut(QKeySequence.StandardKey.Undo, self)
+        self.undo_shortcut.activated.connect(self.canvas.undo)
+
+        if self.boxes:
             self.canvas.set_data(self.sample_frame, self.boxes, self.rows, self.cols)
             self._rebuild_chamber_buttons()
+            self.tip_label.setText(f"<b>Loaded {len(self.boxes)} calibrated chambers</b>.")
         else:
-            self.boxes = []
             self.canvas.set_data(self.sample_frame, [], self.rows, self.cols)
             self.canvas.start_redraw_first_roi()
 
@@ -769,7 +1088,6 @@ class ChamberCalibrationDialog(QDialog):
         main_layout.setContentsMargins(14, 14, 14, 14)
         main_layout.setSpacing(14)
 
-        # Left: Interactive Canvas
         left_layout = QVBoxLayout()
         self.canvas = InteractiveChamberCanvas()
         self.canvas.firstRoiDrawn.connect(self._on_first_roi_drawn)
@@ -781,14 +1099,12 @@ class ChamberCalibrationDialog(QDialog):
         self.tip_label.setStyleSheet("color: #E2E8F0; font-size: 13px; background-color: #1E293B; padding: 8px; border-radius: 6px;")
         left_layout.addWidget(self.tip_label)
 
-        # Right: Control Panel
         right_layout = QVBoxLayout()
         right_layout.setSpacing(10)
 
-        # 1. Grid Geometry
         grp_grid = QGroupBox("1. Grid Geometry")
         v_grid = QVBoxLayout()
-        
+
         h_dim = QHBoxLayout()
         h_dim.addWidget(QLabel("Rows:"))
         self.spin_rows = QSpinBox()
@@ -846,25 +1162,20 @@ class ChamberCalibrationDialog(QDialog):
         # 3. Vision Tools, Auto-Snap & Undo
         grp_tools = QGroupBox("3. Visual Tools and History")
         v_tools = QVBoxLayout()
-        
-        btn_undo = QPushButton("Undo Last Action")
+
+        btn_undo = QPushButton("Undo Last Action (Ctrl+Z)")
         btn_undo.setStyleSheet("background-color: #475569; color: white; font-weight: bold; padding: 6px; border-radius: 4px;")
         btn_undo.clicked.connect(self.canvas.undo)
         v_tools.addWidget(btn_undo)
 
         btn_snap = QPushButton("Auto-Snap Tube Boundaries")
-        btn_snap.setStyleSheet("background-color:  #334155; color: white; padding: 6px; border-radius: 5px;")
+        btn_snap.setStyleSheet("background-color: #334155; color: white; padding: 6px; border-radius: 5px;")
         btn_snap.clicked.connect(self._on_auto_snap)
         v_tools.addWidget(btn_snap)
 
-        self.btn_mask = QPushButton("Toggle Darkness Energy Mask")
-        self.btn_mask.setStyleSheet("background-color: #334155; color: white; padding: 6px; border-radius: 5px;")
-        self.btn_mask.clicked.connect(self._toggle_mask)
-        v_tools.addWidget(self.btn_mask)
         grp_tools.setLayout(v_tools)
         right_layout.addWidget(grp_tools)
 
-        # 4. Quick Chamber Selector
         grp_sel = QGroupBox("4. Active Chamber (1..N)")
         v_sel = QVBoxLayout()
         self.scroll_ch = QScrollArea()
@@ -881,7 +1192,6 @@ class ChamberCalibrationDialog(QDialog):
 
         right_layout.addStretch()
 
-        # Dialog Buttons
         h_btn = QHBoxLayout()
         btn_cancel = QPushButton("Cancel")
         btn_cancel.clicked.connect(self.reject)
@@ -896,7 +1206,6 @@ class ChamberCalibrationDialog(QDialog):
         main_layout.addLayout(right_layout, 3)
 
     def _on_selection_changed(self, count: int):
-        """当多选时，禁用按行/按列模式"""
         multi = (count > 1)
         self.rb_col.setEnabled(not multi)
         self.rb_row.setEnabled(not multi)
@@ -907,28 +1216,13 @@ class ChamberCalibrationDialog(QDialog):
     def _on_auto_snap(self):
         if self.sample_frame is None or not self.canvas.boxes:
             return
-
         base_boxes = [list(b) for b in self.canvas.boxes]
-
-        # 1. 调用刚性 1D 吸附策略
         refined = RobustGridAligner.snap_all_boxes(
             frame_bgr=self.sample_frame,
             boxes=base_boxes,
             rows=self.rows,
-            cols=self.cols
+            cols=self.cols,
         )
-
-        # 2. 幂等性检查：若所有单边变化 <= 1px 则认定已完全贴合，不再重复更新
-        has_effective_change = False
-        for old, new in zip(base_boxes, refined):
-            if any(abs(o - n) > 1 for o, n in zip(old, new)):
-                has_effective_change = True
-                break
-
-        if not has_effective_change:
-            return
-
-        # 3. 提交生效
         self.canvas._push_undo()
         self.canvas.boxes = refined
         self.canvas._update_fly_detections()
@@ -943,11 +1237,8 @@ class ChamberCalibrationDialog(QDialog):
         self.rows = self.spin_rows.value()
         self.cols = self.spin_cols.value()
         self.order = "column_first" if self.combo_ord.currentIndex() == 0 else "row_first"
-        
         if self.last_first_box is not None:
             self._recompute_inference()
-        else:
-            self.tip_label.setText(f"<b>Draw the first tube (CH 1) in top-left</b>: System will infer {self.rows} Rows × {self.cols} Cols.")
 
     def _recompute_inference(self):
         if self.sample_frame is not None and self.last_first_box is not None:
@@ -956,16 +1247,16 @@ class ChamberCalibrationDialog(QDialog):
                 self.last_first_box,
                 rows=self.rows,
                 cols=self.cols,
-                order=self.order
+                order=self.order,
             )
             self.boxes = [list(b) for b in estimated_boxes]
             self.canvas.set_data(self.sample_frame, self.boxes, self.rows, self.cols)
             self._rebuild_chamber_buttons()
-            self.tip_label.setText(f"<b>Generated {len(self.boxes)} Chambers ({self.rows}x{self.cols})</b>. You can directly drag on the canvas.")
+            self.tip_label.setText(f"<b>Generated {len(self.boxes)} Chambers ({self.rows}x{self.cols})</b>. Drag to fine-tune.")
 
     def _on_click_redraw(self):
         self.canvas.start_redraw_first_roi()
-        self.tip_label.setText(f"<b>Draw the first tube (CH 1) in top-left</b>...")
+        self.tip_label.setText("<b>Draw the first tube (CH 1) in top-left</b>...")
 
     def _rebuild_chamber_buttons(self):
         while self.grid_ch.count():
@@ -984,6 +1275,8 @@ class ChamberCalibrationDialog(QDialog):
 
     def _select_chamber(self, idx: int):
         self.canvas.selected_idx = max(0, min(len(self.canvas.boxes) - 1, idx))
+        self.canvas.selected_indices = {self.canvas.selected_idx}
+        self.canvas.selectionChanged.emit(1)
         self.canvas.update()
 
     def _on_canvas_box_changed(self):
@@ -993,10 +1286,6 @@ class ChamberCalibrationDialog(QDialog):
 
     def _set_mode(self, mode: str):
         self.canvas.link_mode = mode
-
-    def _toggle_mask(self):
-        self.canvas.show_mask = not self.canvas.show_mask
-        self.canvas.update()
 
     def get_chambers(self) -> List[Tuple[int, int, int, int]]:
         return [tuple(b) for b in self.canvas.boxes]
@@ -1305,11 +1594,9 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(16, 16, 16, 16)
         main_layout.setSpacing(16)
 
-        # Left Column: File Management & Pairing
         left_layout = QVBoxLayout()
         left_layout.setSpacing(10)
-        header_import = QLabel("<b>1. Batch File Import</b>")
-        left_layout.addWidget(header_import)
+        left_layout.addWidget(QLabel("<b>1. Batch File Import</b>"))
 
         self.drop_area = DragDropArea()
         self.drop_area.filesChanged.connect(self.on_files_updated)
@@ -1325,35 +1612,15 @@ class MainWindow(QMainWindow):
         btn_row = QHBoxLayout()
         self.btn_calibrate = QPushButton("Calibrate Chamber ROI")
         self.btn_calibrate.clicked.connect(self.calibrate_selected_session)
-        self.btn_calibrate.setStyleSheet("""
-            QPushButton {
-                background-color: #0284C7;
-                color: white;
-                border: 1px solid #0369A1;
-                padding: 7px 12px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background-color: #0369A1; }
-        """)
+        self.btn_calibrate.setStyleSheet("background-color: #0284C7; color: white; padding: 7px; font-weight: bold; border-radius: 4px;")
         btn_row.addWidget(self.btn_calibrate)
 
         btn_clear = QPushButton("Clear List")
         btn_clear.clicked.connect(self.clear_all)
-        btn_clear.setStyleSheet("""
-            QPushButton {
-                background-color: #ECEFF1;
-                border: 1px solid #B0BEC5;
-                padding: 7px 12px;
-                border-radius: 4px;
-                font-weight: 500;
-            }
-            QPushButton:hover { background-color: #CFD8DC; }
-        """)
+        btn_clear.setStyleSheet("background-color: #ECEFF1; padding: 7px; font-weight: 500; border-radius: 4px;")
         btn_row.addWidget(btn_clear)
         left_layout.addLayout(btn_row)
 
-        # Right Column: Modules & Execution Parameters
         right_layout = QVBoxLayout()
         right_layout.setSpacing(10)
 
@@ -1400,9 +1667,10 @@ class MainWindow(QMainWindow):
         vbox_a = QVBoxLayout()
         self.cb_save_clean = QCheckBox("Export Cleaned Location Data (*_cleaned.csv)")
         self.cb_save_clean.setChecked(True)
-        vbox_a.addWidget(self.cb_save_clean)
-        grp_a.setLayout(vbox_a)
-        right_layout.addWidget(grp_a)
+        vbox_prep.addWidget(self.cb_save_raw)
+        vbox_prep.addWidget(self.cb_save_clean)
+        grp_prep.setLayout(vbox_prep)
+        right_layout.addWidget(grp_prep)
 
         # Module 3: Kinetics & Gas Delivery Onset
         grp_b = QGroupBox("Module 3:Gas Delivery Onset and Kinetics Thresholds")
@@ -1476,7 +1744,7 @@ class MainWindow(QMainWindow):
         vbox_c = QVBoxLayout()
         self.cb_plot_act_pos = QCheckBox("Dual Y-Axis Behavioral Overview (*_activity_position.png)")
         self.cb_plot_act_pos.setChecked(True)
-        self.cb_plot_kymo = QCheckBox("Normalized Space-Time Kymograph (*_kymograph_norm.png)")
+        self.cb_plot_kymo = QCheckBox("Space-Time Kymograph Heatmap (*_kymograph_norm.png)")
         self.cb_plot_kymo.setChecked(True)
         
         # 新增：生存阶梯图复选框
@@ -1498,58 +1766,26 @@ class MainWindow(QMainWindow):
         self.lbl_status.setStyleSheet("color: #546E7A; font-size: 13px;")
         right_layout.addWidget(self.lbl_status)
 
-        # Bottom Execution Buttons
         h_exec_row = QHBoxLayout()
-        
         self.btn_track_only = QPushButton("Track Fly Only")
         self.btn_track_only.setFixedHeight(46)
-        self.btn_track_only.setStyleSheet("""
-            QPushButton {
-                background-color: #0284C7;
-                color: white;
-                font-weight: bold;
-                font-size: 13px;
-                border-radius: 6px;
-            }
-            QPushButton:hover { background-color: #0369A1; }
-            QPushButton:disabled { background-color: #BDBDBD; }
-        """)
+        self.btn_track_only.setStyleSheet("background-color: #0284C7; color: white; font-weight: bold; border-radius: 6px;")
         self.btn_track_only.clicked.connect(self.execute_tracking_only)
         h_exec_row.addWidget(self.btn_track_only, 2)
 
-        self.btn_run = QPushButton("Run Selected Module")
+        self.btn_run = QPushButton("Run Selected Modules")
         self.btn_run.setFixedHeight(46)
-        self.btn_run.setStyleSheet("""
-            QPushButton {
-                background-color: #2E7D32;
-                color: white;
-                font-weight: bold;
-                font-size: 13px;
-                border-radius: 6px;
-            }
-            QPushButton:hover { background-color: #1B5E20; }
-            QPushButton:disabled { background-color: #BDBDBD; }
-        """)
+        self.btn_run.setStyleSheet("background-color: #2E7D32; color: white; font-weight: bold; border-radius: 6px;")
         self.btn_run.clicked.connect(self.execute_tasks)
         h_exec_row.addWidget(self.btn_run, 3)
 
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setFixedHeight(46)
         self.btn_cancel.setEnabled(False)
-        self.btn_cancel.setStyleSheet("""
-            QPushButton {
-                background-color: #D32F2F;
-                color: white;
-                font-weight: bold;
-                font-size: 13px;
-                border-radius: 6px;
-            }
-            QPushButton:hover { background-color: #B71C1C; }
-            QPushButton:disabled { background-color: #EF9A9A; color: #ECEFF1; }
-        """)
+        self.btn_cancel.setStyleSheet("background-color: #D32F2F; color: white; font-weight: bold; border-radius: 6px;")
         self.btn_cancel.clicked.connect(self.cancel_execution)
         h_exec_row.addWidget(self.btn_cancel, 1)
-        
+
         right_layout.addLayout(h_exec_row)
 
         main_layout.addLayout(left_layout, 5)
@@ -1623,30 +1859,28 @@ class MainWindow(QMainWindow):
         if row < 0 and self.matched_pairs:
             row = 0
         if row < 0 or not self.matched_pairs:
-            QMessageBox.information(self, "Select Session", "Please drag and select a video session to calibrate chamber ROIs.")
+            QMessageBox.information(self, "Select Session", "Please select a video session to calibrate.")
             return
-        base_keys = list(self.matched_pairs.keys())
-        if row >= len(base_keys):
-            return
-        base = base_keys[row]
+        base = list(self.matched_pairs.keys())[row]
         session = self.matched_pairs[base]
         vid_path = session.get("video")
         if not vid_path:
-            QMessageBox.information(self, "No Video", f"Session '{base}' does not contain an associated video file.")
+            QMessageBox.information(self, "No Video", f"Session '{base}' does not contain a video file.")
             return
 
-        self.sync_ui_to_config()
         dlg = ChamberCalibrationDialog(
             vid_path,
             parent=self,
             initial_chambers=session.get("chamber_rois"),
-            rows=self.config.grid_rows,
-            cols=self.config.grid_cols,
-            order=self.config.grid_order
+            rows=session.get("grid_rows", getattr(self.config, "grid_rows", 4)),
+            cols=session.get("grid_cols", getattr(self.config, "grid_cols", 2)),
+            order=session.get("grid_order", getattr(self.config, "grid_order", "column_first")),
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            rois = dlg.get_chambers()
-            self.matched_pairs[base]["chamber_rois"] = rois
+            session["chamber_rois"] = dlg.get_chambers()
+            session["grid_rows"] = dlg.rows
+            session["grid_cols"] = dlg.cols
+            session["grid_order"] = dlg.order
             QMessageBox.information(
                 self,
                 "Calibration Saved",
@@ -1671,11 +1905,26 @@ class MainWindow(QMainWindow):
             self.current_worker.cancel()
             self.btn_cancel.setEnabled(False)
 
-    def on_worker_progress(self, processed: int, total: int, status_text: str):
-        self.lbl_status.setText(status_text)
+    def update_status_progress(self, processed: int, total: int, status_text: str):
+        if total > 1:
+            display_text = f"[{processed}/{total} Sessions] {status_text}"
+        else:
+            display_text = status_text
+        self.lbl_status.setText(display_text)
+
+    def clear_all(self):
+        self.drop_area.all_files = []
+        self.drop_area.label.setText("Drag & Drop CSV or Video files here\n(or click to browse)")
+        self.pair_list.clear()
+        self.matched_pairs = {}
+        self.lbl_status.setText("Ready, awaiting task execution.")
 
     def on_session_finished(self, base: str, res: dict):
-        pass
+        for idx in range(self.pair_list.count()):
+            item = self.pair_list.item(idx)
+            if item.text().startswith(base):
+                item.setText(f"{base}  ->  [Completed]")
+                break
 
     def on_worker_finished(self, results: dict):
         self.btn_run.setEnabled(True)
@@ -1683,12 +1932,27 @@ class MainWindow(QMainWindow):
         self.btn_cancel.setEnabled(False)
         self.current_worker = None
         total = len(self.matched_pairs)
-        completed = len(results)
-        self.lbl_status.setText(f"Batch processing complete: {completed}/{total} sessions processed.")
+        self.lbl_status.setText(f"Batch processing complete: {len(results)}/{total} sessions processed.")
+        QMessageBox.information(self, "Execution Complete", f"All tasks finished!\nProcessed {len(results)}/{total} experiments.")
+
+    def on_tracking_session_finished(self, base: str, res: dict):
+        for idx in range(self.pair_list.count()):
+            item = self.pair_list.item(idx)
+            if item.text().startswith(base):
+                item.setText(f"{base}  ->  [Video Tracked: Raw CSV Generated]")
+                break
+
+    def on_tracking_finished(self, results: dict):
+        self.btn_track_only.setEnabled(True)
+        self.btn_run.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        self.current_worker = None
+        count = len(results)
+        self.lbl_status.setText(f"Vision tracking complete: {count} raw trajectory CSV files generated.")
         QMessageBox.information(
             self,
-            "Execution Complete",
-            f"All sessions processed successfully!\nCompleted: {completed}/{total} experiments."
+            "Tracking Complete",
+            f"Vision tracking complete!\nSuccessfully extracted coordinates for {count} videos into *_raw.csv.",
         )
 
     def on_worker_error(self, base: str, error_msg: str):
@@ -1740,38 +2004,49 @@ class MainWindow(QMainWindow):
         self.btn_track_only.setEnabled(False)
         self.btn_run.setEnabled(False)
         self.btn_cancel.setEnabled(True)
-        self.lbl_status.setText("Starting vision tracking worker thread pool...")
+        self.lbl_status.setText("Initializing video vision tracking...")
 
         worker = TrackingOnlyWorker(
             matched_pairs=self.matched_pairs,
-            config=self.config
+            config=self.config,
+            save_raw_csv=self.cb_save_raw.isChecked(),
         )
-        worker.signals.progress.connect(self.on_worker_progress)
+        worker.signals.progress.connect(self.update_status_progress)
         worker.signals.session_finished.connect(self.on_tracking_session_finished)
         worker.signals.finished.connect(self.on_tracking_finished)
         worker.signals.error.connect(self.on_worker_error)
+
         self.current_worker = worker
         self.thread_pool.start(worker)
-        
 
-    def on_tracking_session_finished(self, base: str, res: dict):
-        self.pair_list.clear()
-        for b, paths in self.matched_pairs.items():
-            status = "[Paired] CSV + Video" if (paths.get("csv") and paths.get("video")) else "[Video Tracked]"
-            self.pair_list.addItem(f"{b}  ->  {status}")
+    def execute_tasks(self):
+        if not self.matched_pairs:
+            QMessageBox.warning(self, "Warning", "No sessions loaded for execution!")
+            return
 
-    def on_tracking_finished(self, results: dict):
-        self.btn_track_only.setEnabled(True)
-        self.btn_run.setEnabled(True)
-        self.btn_cancel.setEnabled(False)
-        self.current_worker = None
-        count = len(results)
-        self.lbl_status.setText(f"Vision tracking complete: Generated {count} raw trajectory CSV files.")
-        QMessageBox.information(
-            self,
-            "Tracking Complete",
-            f"Vision tracking complete!\nSuccessfully extracted coordinates for {count} videos into *_raw.csv."
+        self.sync_ui_to_config()
+        self.btn_run.setEnabled(False)
+        self.btn_track_only.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
+        self.lbl_status.setText("Starting asynchronous processing thread pool...")
+
+        worker = PipelineBatchWorker(
+            matched_pairs=self.matched_pairs,
+            config=self.config,
+            anesthesia_onset_time=float(self.spin_gas_onset.value()),
+            save_raw_csv=self.cb_save_raw.isChecked(),
+            save_cleaned_csv=self.cb_save_clean.isChecked(),
+            plot_act_pos=self.cb_plot_act_pos.isChecked(),
+            plot_kymo=self.cb_plot_kymo.isChecked(),
+            render_video_overlay=self.cb_video_overlay.isChecked(),
         )
+        worker.signals.progress.connect(self.update_status_progress)
+        worker.signals.session_finished.connect(self.on_session_finished)
+        worker.signals.finished.connect(self.on_worker_finished)
+        worker.signals.error.connect(self.on_worker_error)
+
+        self.current_worker = worker
+        self.thread_pool.start(worker)
 
 
 def run_gui():

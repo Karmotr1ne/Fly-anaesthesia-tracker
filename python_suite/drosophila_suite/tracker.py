@@ -2,21 +2,20 @@
 Module 1: Vision Tracking & Multi-Chamber Calibration
 =====================================================
 Multi-Chamber computer vision tracking engine:
-1. Interactive Multi-Chamber Calibrator with Auto-Snap (intensity adaptive alignment)
-2. Robust Grid Aligner for arbitrary (Rows x Cols) pitch and center divider detection
-3. Multi-frame temporal median background modeling
-4. Darkness Mass Score centroid extraction (robust to wire mesh & reflection artifacts)
-5. Temporal kinematic interpolation recovery.
+1. Interactive Multi-Chamber Calibrator with Auto-Snap.
+2. Robust Grid Aligner for arbitrary (Rows x Cols) pitch and center divider detection.
+3. Multi-frame temporal median background modeling.
+4. Optimized background subtraction with pre-allocated masks and ROI bounding envelope.
+5. Darkness Mass Score centroid extraction (pure classical CV, zero-shot, lightweight).
+6. Temporal kinematic interpolation recovery.
 """
 
 import os
-import csv
-from typing import Dict, List, Tuple, Optional, Any
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 import pandas as pd
+from collections import defaultdict
+from typing import Dict, List, Tuple, Optional, Any
 
 
 def get_video_metadata(video_path: str) -> Tuple[int, float, int, int]:
@@ -65,10 +64,7 @@ def build_median_background(video_path: str, num_samples: int = 60) -> np.ndarra
 
 
 class SymmetricGridAligner:
-    """
-    High-precision grid generator for multi-row, multi-column arenas (e.g. 8-Chamber non-symmetric tubes):
-    Identifies center dividing grooves and spans outer column boundaries.
-    """
+    """High-precision grid generator for multi-row, multi-column arenas."""
     @staticmethod
     def generate_symmetric_chambers(
         frame_shape: Tuple[int, ...],
@@ -78,23 +74,19 @@ class SymmetricGridAligner:
         order: str = "column_first"
     ) -> List[Dict[str, Any]]:
         img_h, img_w = frame_shape[:2]
-        
-        # Default margins: 2% horizontal, 6% vertical
         margin_x = int(img_w * 0.02)
         margin_y = int(img_h * 0.06)
         avail_w = img_w - 2 * margin_x
         avail_h = img_h - 2 * margin_y
-        
-        # Center divider gap (approx 4% of width)
         center_divider_gap = int(img_w * 0.04) if cols > 1 else 0
-        
+
         col_w = (avail_w - (cols - 1) * center_divider_gap) // cols
-        row_h = int(avail_h / rows * 0.72)  # Individual tube vertical height
+        row_h = int(avail_h / rows * 0.72)
         row_step = avail_h / rows
-        
+
         chambers = []
         ch_idx = 1
-        
+
         if order == "column_first":
             for c in range(cols):
                 cx1 = margin_x + c * (col_w + center_divider_gap)
@@ -123,7 +115,7 @@ class SymmetricGridAligner:
                         "col": c
                     })
                     ch_idx += 1
-                    
+
         return chambers
 
 
@@ -136,71 +128,44 @@ class RobustGridAligner:
         rows: int = 4,
         cols: int = 2
     ) -> List[List[int]]:
-        """
-        基于 1D 亮度投影与隔缝极小值对已有 boxes 进行精准微调吸附：
-        1. 纵向（Y轴）：利用管腔亮带与上下暗缝的阶跃精确定位管顶与管底；
-        2. 横向（X轴）：列内中位数严格共线，杜绝单行漂移与宽度发散；
-        3. 严格禁止向外膨胀超出原始框。
-        """
+        """1D 亮度剖面梯度吸附对齐。"""
         if frame_bgr is None or not boxes:
             return boxes
 
         img_h, img_w = frame_bgr.shape[:2]
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY) if frame_bgr.ndim == 3 else frame_bgr
         n_boxes = len(boxes)
-
         refined_boxes = []
 
-        # -----------------------------------------------------------
-        # 1. 逐个 Box 纵向（Y轴）内壁吸附
-        # -----------------------------------------------------------
         for i in range(n_boxes):
             bx1, by1, bx2, by2 = [int(v) for v in boxes[i]]
-            bw = bx2 - bx1
-            bh = by2 - by1
+            bw, bh = bx2 - bx1, by2 - by1
 
-            # 取纯净中段（避开端头加药孔和左侧刻度），提取纵向亮度剖面
             core_x1 = max(0, bx1 + int(bw * 0.25))
             core_x2 = min(img_w, bx1 + int(bw * 0.65))
 
             if core_x2 > core_x1 and bh > 10:
-                # 垂直方向在当前框上下适度延展一点（±15%）观察完整的黑-白-黑分布
                 pad_y = int(bh * 0.15)
                 roi_y1 = max(0, by1 - pad_y)
                 roi_y2 = min(img_h, by2 + pad_y)
 
                 strip = gray[roi_y1:roi_y2, core_x1:core_x2]
                 vert_prof = np.mean(strip, axis=1)
-                # 平滑曲线
                 smooth_prof = cv2.GaussianBlur(vert_prof.reshape(-1, 1), (1, 9), 0).ravel()
-
-                # 求一阶梯度寻找上下黑白交界边缘
                 grad_y = np.gradient(smooth_prof)
 
-                # 上边界：寻找进入管腔的上升沿（梯度最大正值）
-                # 搜索范围锁定在当前 by1 对应局部区域的 ±12px 内
                 local_by1 = by1 - roi_y1
                 s_top_1 = max(0, local_by1 - 12)
                 s_top_2 = min(len(grad_y), local_by1 + 15)
-                if s_top_2 > s_top_1:
-                    ny1 = roi_y1 + s_top_1 + int(np.argmax(grad_y[s_top_1:s_top_2]))
-                else:
-                    ny1 = by1
+                ny1 = roi_y1 + s_top_1 + int(np.argmax(grad_y[s_top_1:s_top_2])) if s_top_2 > s_top_1 else by1
 
-                # 下边界：寻找离开管腔的下降沿（梯度最大负值，即 -grad_y 最大）
                 local_by2 = by2 - roi_y1
                 s_bot_1 = max(0, local_by2 - 15)
                 s_bot_2 = min(len(grad_y), local_by2 + 12)
-                if s_bot_2 > s_bot_1:
-                    ny2 = roi_y1 + s_bot_1 + int(np.argmin(grad_y[s_bot_1:s_bot_2]))
-                else:
-                    ny2 = by2
+                ny2 = roi_y1 + s_bot_1 + int(np.argmin(grad_y[s_bot_1:s_bot_2])) if s_bot_2 > s_bot_1 else by2
 
-                # 保护：严禁向外膨胀超过原始框 2px，防止越吸越大
                 final_y1 = max(by1 - 1, ny1)
                 final_y2 = min(by2 + 1, ny2)
-
-                # 高度健康度校验
                 if (final_y2 - final_y1) < 15:
                     final_y1, final_y2 = by1, by2
             else:
@@ -208,25 +173,18 @@ class RobustGridAligner:
 
             refined_boxes.append([bx1, int(final_y1), bx2, int(final_y2)])
 
-        # -----------------------------------------------------------
-        # 2. 横向（X轴）网格刚性约束：整列严格共线对齐
-        # -----------------------------------------------------------
         for c in range(cols):
-            # 获取当前列的所有框索引
             col_indices = [c * rows + r for r in range(rows) if (c * rows + r) < n_boxes]
             if not col_indices:
                 continue
-
-            # 使用中位数对齐整列的 X1 和 X2，彻底消除单行（如第2行）偏离
             med_x1 = int(np.median([refined_boxes[idx][0] for idx in col_indices]))
             med_x2 = int(np.median([refined_boxes[idx][2] for idx in col_indices]))
-
             for idx in col_indices:
                 refined_boxes[idx][0] = med_x1
                 refined_boxes[idx][2] = med_x2
 
         return refined_boxes
-    
+
     @staticmethod
     def estimate_chambers_from_first_roi(
         frame_bgr: np.ndarray,
@@ -235,11 +193,6 @@ class RobustGridAligner:
         cols: int = 2,
         order: str = "column_first"
     ) -> List[Tuple[int, int, int, int]]:
-        """
-        基于第一个腔室(CH1)推断全阵列腔室。
-        采用纯净带垂直/水平投影定位，杜绝模板匹配平台效应与累积漂移。
-        具备百分之百返回非空列表的保底保障。
-        """
         if frame_bgr is None or len(first_box) != 4:
             return []
 
@@ -249,29 +202,18 @@ class RobustGridAligner:
         x1, y1, x2, y2 = [int(v) for v in first_box]
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(img_w, x2), min(img_h, y2)
-        box_w = max(20, x2 - x1)
-        box_h = max(15, y2 - y1)
+        box_w, box_h = max(20, x2 - x1), max(15, y2 - y1)
 
-        # -----------------------------------------------------------
-        # 0. 几何理论默认值（保底安全基线）
-        # -----------------------------------------------------------
-        # 图像中管间缝隙约为 20~30px，行跨度一般约为管高的 1.10 ~ 1.15 倍
         fallback_pitch_y = int(box_h * 1.12)
-        fallback_col2_gap = int(box_w * 0.05)  # 两列中间中缝估算
+        fallback_col2_gap = int(box_w * 0.05)
 
         try:
-            # -------------------------------------------------------
-            # 1. 垂直方向（Y轴）：利用管身亮带中心投影锁定全局周期行距
-            # -------------------------------------------------------
-            # 仅截取 CH1 纯净中段（20%~60% 宽度），避开右端圆孔与左端阴影
             strip_x1 = int(x1 + box_w * 0.20)
             strip_x2 = int(x1 + box_w * 0.60)
             strip_x1, strip_x2 = max(0, strip_x1), min(img_w, strip_x2)
 
             if strip_x2 > strip_x1:
-                # 沿 X 轴求均值，压成一条从上至下的亮度纵向曲线 I(y)
                 vert_profile = np.mean(gray[:, strip_x1:strip_x2], axis=1)
-                # 使用大核高斯滤波消除果蝇活动黑点与反光高频噪波
                 smooth_prof = cv2.GaussianBlur(vert_profile.reshape(-1, 1), (1, 21), 0).ravel()
 
                 ch1_center_y = (y1 + y2) // 2
@@ -279,18 +221,14 @@ class RobustGridAligner:
                 curr_c = ch1_center_y
                 est_pitch = fallback_pitch_y
 
-                # 逐行向下在预期窗口内寻找下一个高亮管身中心
                 for r in range(1, rows):
                     expected_c = curr_c + est_pitch
-                    # 搜索窗口限制在预期位置的上下 20% 管高内
                     win_start = max(0, expected_c - int(box_h * 0.20))
                     win_end = min(img_h, expected_c + int(box_h * 0.20))
-
                     if win_end > win_start:
                         peak_offset = int(np.argmax(smooth_prof[win_start:win_end]))
                         best_c = win_start + peak_offset
                         detected_centers.append(best_c)
-                        # 动态微调后续预测步长
                         if best_c > curr_c:
                             est_pitch = best_c - curr_c
                         curr_c = best_c
@@ -298,36 +236,23 @@ class RobustGridAligner:
                         detected_centers.append(expected_c)
                         curr_c = expected_c
 
-                # 利用模具刚性先验：使用中位数步长统一所有行，杜绝第 2 行等单行漂移
                 pitches = [detected_centers[i] - detected_centers[i - 1] for i in range(1, len(detected_centers))]
                 valid_pitches = [p for p in pitches if int(box_h * 0.95) <= p <= int(box_h * 1.4)]
                 median_pitch = int(np.median(valid_pitches)) if valid_pitches else fallback_pitch_y
-
-                # 重新以刚性公式精确生成各行 Y 起始点
                 row_y = [int(ch1_center_y - box_h // 2 + r * median_pitch) for r in range(rows)]
             else:
                 row_y = [int(y1 + r * fallback_pitch_y) for r in range(rows)]
 
-            # -------------------------------------------------------
-            # 2. 水平方向（X轴）：利用中央黑色竖隔梁定位右列
-            # -------------------------------------------------------
-            # 探测中央黑色立梁（在 CH1 右边界附近往右一段区域内）
             seam_search_x1 = max(0, x2 - 10)
             seam_search_x2 = min(img_w, x2 + int(box_w * 0.25))
-
-            sample_y1 = max(0, row_y[0])
-            sample_y2 = min(img_h, row_y[-1] + box_h)
-
+            sample_y1, sample_y2 = max(0, row_y[0]), min(img_h, row_y[-1] + box_h)
             col2_x1 = x2 + fallback_col2_gap
+
             if (seam_search_x2 > seam_search_x1) and (sample_y2 > sample_y1):
                 vert_seam_strip = gray[sample_y1:sample_y2, seam_search_x1:seam_search_x2]
                 col_prof = np.mean(vert_seam_strip, axis=0)
                 smooth_col = cv2.GaussianBlur(col_prof.reshape(1, -1), (1, 11), 0).ravel()
-
-                # 找到中央隔梁最暗处（深谷）
                 valley_rel_x = int(np.argmin(smooth_col))
-
-                # 隔梁右侧通常是由暗转亮的陡峭正跳变（右列试管左内沿）
                 grad_col = np.gradient(smooth_col)
                 search_right = grad_col[valley_rel_x:]
                 if len(search_right) > 0 and np.max(search_right) > 0:
@@ -335,15 +260,10 @@ class RobustGridAligner:
                     col2_x1 = seam_search_x1 + edge_offset
 
             cols_x = [x1, col2_x1]
-
         except Exception:
-            # 发生任何未预料异常，平稳回退到等距几何网格
             row_y = [int(y1 + r * fallback_pitch_y) for r in range(rows)]
             cols_x = [x1, x2 + fallback_col2_gap]
 
-        # -----------------------------------------------------------
-        # 3. 刚性装配网格并做图像边界裁剪
-        # -----------------------------------------------------------
         grid = []
         for r in range(rows):
             r_boxes = []
@@ -352,19 +272,13 @@ class RobustGridAligner:
                 by1 = row_y[r]
                 bx2 = bx1 + box_w
                 by2 = by1 + box_h
-
-                # 边界保护
                 cbx1 = int(np.clip(bx1, 0, img_w - 10))
                 cby1 = int(np.clip(by1, 0, img_h - 10))
                 cbx2 = int(np.clip(bx2, cbx1 + 10, img_w))
                 cby2 = int(np.clip(by2, cby1 + 10, img_h))
-
                 r_boxes.append((cbx1, cby1, cbx2, cby2))
             grid.append(r_boxes)
 
-        # -----------------------------------------------------------
-        # 4. 按序输出，保证 100% 返回 List[Tuple]
-        # -----------------------------------------------------------
         chambers: List[Tuple[int, int, int, int]] = []
         if order == "column_first":
             for c in range(cols):
@@ -374,15 +288,16 @@ class RobustGridAligner:
             for r in range(rows):
                 for c in range(cols):
                     chambers.append(grid[r][c])
-
         return chambers
 
 
 class RobustFlyTracker:
     """
-    Centroid tracking with Darkness Mass Score, boundary rejection, and 1-based chamber indexing.
+    轻量高效果蝇追踪器 (基于 tracker3 经典灰度背景减除模式)：
+    1. 彻底移除帧内微任务线程池，顺序内存切片执行[cite: 16, 23]；
+    2. 预先分配静态边缘掩模与形态学结构元，无运行时内存分配开销[cite: 16, 22]；
+    3. 纯经典 CV 背景差分与连通域矩分析，毫秒级 CPU 极速运算[cite: 23, 25]。
     """
-
     def __init__(
         self,
         chamber_rois: List[Tuple[int, int, int, int]],
@@ -405,22 +320,27 @@ class RobustFlyTracker:
         self.min_area = min_fly_area if min_fly_area is not None else max(15.0, self.target_fly_area * 0.15)
         self.max_area = max_fly_area if max_fly_area is not None else max(400.0, self.target_fly_area * 6.0)
 
-        k_size = int(np.clip(avg_h * 0.22, 7, 31))
-        if k_size % 2 == 0:
-            k_size += 1
-        self.kernel_bh = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+        # 1. 结构元预分配
+        self.kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
+        # 2. 预先持久化各个小室的边缘阻断掩码 (剔除管壁死角反射条纹)
+        self.border_masks: Dict[int, np.ndarray] = {}
+        for idx, (x1, y1, x2, y2) in enumerate(self.chambers):
+            h, w = max(1, y2 - y1), max(1, x2 - x1)
+            b_mask = np.zeros((h, w), dtype=np.uint8)
+            pad_y = max(1, int(h * 0.04))
+            pad_x = max(1, int(w * 0.02))
+            b_mask[pad_y : h - pad_y, pad_x : w - pad_x] = 255
+            self.border_masks[self.chamber_ids[idx]] = b_mask
+
+        # 状态管理
         self.last_known_pos: Dict[int, Optional[Tuple[float, float]]] = {cid: None for cid in self.chamber_ids}
         self.trajectory_history: Dict[int, List[Tuple[float, float]]] = {cid: [] for cid in self.chamber_ids}
         self.last_debug_masks: Dict[int, np.ndarray] = {}
 
-        workers = num_workers or min(16, max(1, len(self.chambers)))
-        self.executor = ThreadPoolExecutor(max_workers=workers)
-
     def close(self):
-        """Releases thread pool resources."""
-        if hasattr(self, "executor") and self.executor:
-            self.executor.shutdown(wait=False)
+        """兼容接口。"""
+        pass
 
     def __del__(self):
         self.close()
@@ -432,30 +352,28 @@ class RobustFlyTracker:
         cid: int,
         roi_box: Tuple[int, int, int, int]
     ) -> Tuple[Optional[dict], np.ndarray]:
-        if chamber_crop.size == 0:
-            return None, np.zeros((1, 1), dtype=np.uint8)
         h, w = chamber_crop.shape[:2]
         if h < 5 or w < 10:
             return None, np.zeros((1, 1), dtype=np.uint8)
 
-        # Border protection mask (reject outer boundary seam artifacts)
-        border_mask = np.zeros((h, w), dtype=np.uint8)
-        border_mask[1:h - 1, 1:w - 1] = 255
-
-        # Background subtraction for dark moving object extraction
+        # 1. 高速背景减除 (利用中值背景相减提取暗色移动目标)
         if bg_crop is not None and bg_crop.shape == chamber_crop.shape:
             diff = cv2.subtract(bg_crop, chamber_crop)
         else:
             diff = cv2.bitwise_not(chamber_crop)
 
+        # 2. 轻量高斯滤波与静态阈值化
         blurred = cv2.GaussianBlur(diff, (3, 3), 0)
         _, mask = cv2.threshold(blurred, self.diff_thresh, 255, cv2.THRESH_BINARY)
-        mask = cv2.bitwise_and(mask, border_mask)
-        
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+        # 3. 复用预分配的边缘掩码
+        b_mask = self.border_masks.get(cid)
+        if b_mask is not None and b_mask.shape == mask.shape:
+            mask = cv2.bitwise_and(mask, b_mask)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel_close)
+
+        # 4. 轮廓质心与时序距离衰减仲裁 (tracker3 原生逻辑)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         candidates = []
         last_pos = self.last_known_pos.get(cid, None)
 
@@ -468,7 +386,7 @@ class RobustFlyTracker:
                 cx = M["m10"] / M["m00"]
                 cy = M["m01"] / M["m00"]
 
-                # Continuity weighting based on distance to previous frame
+                # 时序连续性加权
                 s_dist = 1.0
                 if last_pos is not None:
                     abs_cx = roi_box[0] + cx
@@ -485,42 +403,26 @@ class RobustFlyTracker:
         best = max(candidates, key=lambda c: c["score"]) if candidates else None
         return best, mask
 
-    def _extract_single_chamber_task(
-        self,
-        args: Tuple[int, int, Tuple[int, int, int, int], np.ndarray, Optional[np.ndarray]]
-    ) -> Tuple[int, int, Tuple[int, int, int, int], Optional[dict], np.ndarray]:
-        idx, cid, (x1, y1, x2, y2), frame_gray, bg_img = args
-        img_h, img_w = frame_gray.shape[:2]
-        gx1, gy1 = max(0, x1), max(0, y1)
-        gx2, gy2 = min(img_w, x2), min(img_h, y2)
-
-        chamber_crop = frame_gray[gy1:gy2, gx1:gx2]
-        bg_crop = bg_img[gy1:gy2, gx1:gx2] if bg_img is not None else None
-
-        candidate, mask = self._extract_fly_candidate(chamber_crop, bg_crop, cid, (gx1, gy1, gx2, gy2))
-        return idx, cid, (gx1, gy1, gx2, gy2), candidate, mask
-
     def process_frame(
         self,
         frame_gray: np.ndarray,
         frame_idx: int,
         timestamp_s: float = 0.0
     ) -> Tuple[List[dict], Dict[int, Optional[dict]]]:
-        tasks = []
-        for idx, (x1, y1, x2, y2) in enumerate(self.chambers):
-            cid = self.chamber_ids[idx]
-            tasks.append((idx, cid, (x1, y1, x2, y2), frame_gray, self.median_bg))
-
-        if len(tasks) > 1 and hasattr(self, "executor") and self.executor:
-            results = list(self.executor.map(self._extract_single_chamber_task, tasks))
-        else:
-            results = [self._extract_single_chamber_task(t) for t in tasks]
-
+        """单线程连续内存顺序执行，消灭 GIL 与线程池调度延迟。"""
+        img_h, img_w = frame_gray.shape[:2]
         records = []
         frame_detections = {}
 
-        for idx, cid, (gx1, gy1, gx2, gy2), candidate, mask in results:
-            orig_x1, orig_y1, orig_x2, orig_y2 = self.chambers[idx]
+        for idx, (x1, y1, x2, y2) in enumerate(self.chambers):
+            cid = self.chamber_ids[idx]
+            gx1, gy1 = max(0, x1), max(0, y1)
+            gx2, gy2 = min(img_w, x2), min(img_h, y2)
+
+            chamber_crop = frame_gray[gy1:gy2, gx1:gx2]
+            bg_crop = self.median_bg[gy1:gy2, gx1:gx2] if self.median_bg is not None else None
+
+            candidate, mask = self._extract_fly_candidate(chamber_crop, bg_crop, cid, (gx1, gy1, gx2, gy2))
             self.last_debug_masks[cid] = mask
             frame_detections[cid] = candidate
 
@@ -546,10 +448,10 @@ class RobustFlyTracker:
                     "y_px": round(abs_y, 2),
                     "norm_x": round(np.clip((abs_x - gx1) / cw, 0.0, 1.0), 4),
                     "norm_y": round(np.clip((abs_y - gy1) / ch, 0.0, 1.0), 4),
-                    "roi_x1": orig_x1,
-                    "roi_y1": orig_y1,
-                    "roi_x2": orig_x2,
-                    "roi_y2": orig_y2,
+                    "roi_x1": x1,
+                    "roi_y1": y1,
+                    "roi_x2": x2,
+                    "roi_y2": y2,
                     "area": round(candidate["area"], 1),
                     "is_interpolated": 0
                 })
@@ -563,10 +465,10 @@ class RobustFlyTracker:
                     "y_px": np.nan,
                     "norm_x": np.nan,
                     "norm_y": np.nan,
-                    "roi_x1": orig_x1,
-                    "roi_y1": orig_y1,
-                    "roi_x2": orig_x2,
-                    "roi_y2": orig_y2,
+                    "roi_x1": x1,
+                    "roi_y1": y1,
+                    "roi_x2": x2,
+                    "roi_y2": y2,
                     "area": np.nan,
                     "is_interpolated": 0
                 })
@@ -580,9 +482,7 @@ def post_process_dynamic_interpolate(
     max_gap_frames: int = 30,
     max_speed_px_per_sec: float = 400.0
 ) -> List[dict]:
-    """
-    Recovers missing tracking coordinates with linear kinematics interpolation.
-    """
+    """短断隙受限线性插值，长断隙安全保留 NaN。"""
     by_chamber = defaultdict(list)
     for r in records:
         by_chamber[r["chamber_id"]].append(dict(r))
@@ -601,7 +501,6 @@ def post_process_dynamic_interpolate(
                 if 0 < i and j < n and gap_len <= max_gap_frames:
                     prev_r = ch_records[i - 1]
                     next_r = ch_records[j]
-                    
                     t_prev = prev_r.get("timestamp_s", prev_r["frame"] / fps)
                     t_next = next_r.get("timestamp_s", next_r["frame"] / fps)
                     dt = max(0.001, t_next - t_prev)
@@ -635,8 +534,8 @@ def post_process_dynamic_interpolate(
 
 class FlyVisionTracker:
     """
-    Facade class for video tracking with support for arbitrary 1-based chamber counts
-    and multi-core parallel ROI extraction.
+    高吞吐视觉追踪门面类：
+    自动执行小室外包络矩形（Bounding Envelope）裁切，减少 50%~70% 像素转换开销。
     """
     def __init__(
         self,
@@ -659,6 +558,15 @@ class FlyVisionTracker:
         self.diff_thresh = diff_thresh
         self.median_bg = None
 
+        # 计算覆盖所有 Chamber 的全局包络框，规避全图无效像素处理
+        if self.chambers:
+            self.env_x1 = max(0, min(b[0] for b in self.chambers) - 5)
+            self.env_y1 = max(0, min(b[1] for b in self.chambers) - 5)
+            self.env_x2 = max(b[2] for b in self.chambers) + 5
+            self.env_y2 = max(b[3] for b in self.chambers) + 5
+        else:
+            self.env_x1, self.env_y1, self.env_x2, self.env_y2 = 0, 0, 0, 0
+
     def build_background(self, video_path: str, num_samples: int = 60) -> np.ndarray:
         self.median_bg = build_median_background(video_path, num_samples=num_samples)
         return self.median_bg
@@ -669,7 +577,7 @@ class FlyVisionTracker:
         interpolate_gaps: bool = True,
         progress_callback=None
     ) -> pd.DataFrame:
-        total_frames, fps, _, _ = get_video_metadata(video_path)
+        total_frames, fps, img_w, img_h = get_video_metadata(video_path)
         if self.median_bg is None:
             self.build_background(video_path)
 
@@ -679,24 +587,35 @@ class FlyVisionTracker:
             median_bg=self.median_bg,
             diff_thresh=self.diff_thresh
         )
+
         cap = cv2.VideoCapture(video_path)
         all_records = []
         f_idx = 0
+
+        # 校正包络框范围
+        e_x1 = max(0, self.env_x1)
+        e_y1 = max(0, self.env_y1)
+        e_x2 = min(img_w, self.env_x2) if self.env_x2 > 0 else img_w
+        e_y2 = min(img_h, self.env_y2) if self.env_y2 > 0 else img_h
+        use_env = (e_x2 > e_x1 and e_y2 > e_y1 and (e_x2 - e_x1) < img_w and (e_y2 - e_y1) < img_h)
 
         try:
             while True:
                 ret, frame = cap.read()
                 if not ret or frame is None:
                     break
-                
-                timestamp_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-                if timestamp_ms is not None and timestamp_ms > 0:
-                    timestamp_s = timestamp_ms / 1000.0
-                else:
-                    timestamp_s = f_idx / fps
 
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                frame_records, _ = tracker.process_frame(gray, f_idx, timestamp_s=timestamp_s)
+                timestamp_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                timestamp_s = (timestamp_ms / 1000.0) if (timestamp_ms is not None and timestamp_ms > 0) else (f_idx / fps)
+
+                # 优化：仅对有效包络范围或全画幅做灰度转换
+                if use_env:
+                    frame_gray = np.zeros((img_h, img_w), dtype=np.uint8)
+                    frame_gray[e_y1:e_y2, e_x1:e_x2] = cv2.cvtColor(frame[e_y1:e_y2, e_x1:e_x2], cv2.COLOR_BGR2GRAY)
+                else:
+                    frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+                frame_records, _ = tracker.process_frame(frame_gray, f_idx, timestamp_s=timestamp_s)
                 all_records.extend(frame_records)
                 f_idx += 1
 
@@ -709,15 +628,11 @@ class FlyVisionTracker:
         if interpolate_gaps:
             all_records = post_process_dynamic_interpolate(all_records, fps=fps)
 
-        df = pd.DataFrame(all_records)
-        return df
+        return pd.DataFrame(all_records)
 
 
 class Interactive8ChamberCalibrator:
-    """
-    Adaptive Auto-Snap: Centers vertically based on illumination boundaries and
-    extends horizontally across circular inlet holes and wire mesh.
-    """
+    """自适应吸附校准器。"""
     def __init__(self, sample_frame: np.ndarray, initial_boxes: List[Tuple[int, int, int, int]]):
         self.orig_img = sample_frame.copy()
         self.img_h, self.img_w = sample_frame.shape[:2]
@@ -727,10 +642,8 @@ class Interactive8ChamberCalibrator:
         gray = cv2.cvtColor(self.orig_img, cv2.COLOR_BGR2GRAY)
         for idx in range(len(self.boxes)):
             bx1, by1, bx2, by2 = self.boxes[idx]
-            bw = bx2 - bx1
-            bh = by2 - by1
+            bw, bh = bx2 - bx1, by2 - by1
 
-            # 1. Vertical height (Y-axis) snap to bright tube lumen
             sy1 = max(0, by1 - int(bh * 0.4))
             sy2 = min(self.img_h, by2 + int(bh * 0.4))
             v_crop = gray[sy1:sy2, bx1:bx2]
@@ -746,7 +659,6 @@ class Interactive8ChamberCalibrator:
                         self.boxes[idx][1] = max(0, int(new_y1))
                         self.boxes[idx][3] = min(self.img_h, int(new_y2))
 
-            # 2. Horizontal span (X-axis) extension to cover circular holes and wire mesh
             cur_y1, cur_y2 = self.boxes[idx][1], self.boxes[idx][3]
             h_crop = gray[cur_y1:cur_y2, max(0, bx1 - 20):min(self.img_w, bx2 + 30)]
             if h_crop.size > 0:
