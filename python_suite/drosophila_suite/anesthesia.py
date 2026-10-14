@@ -20,7 +20,7 @@ class AnesthesiaAnalyzer:
         anesthesia_still_sec: float = 20.0,       # 沉底静止确认基准窗口 (短序列推荐 15~20s)
         speed_still_thresh: float = 2.0,          # 绝对静止速度门槛 (px/s)
         baseline_quantile: float = 0.75,          # 给药前运动期基线速度分位数
-        sedate_speed_ratio: float = 0.25,         # 镇静减速比率 (低于基线 25%)
+        sedate_speed_ratio: float = 0.05,         # 镇静减速比率 (低于基线 25%)
         floor_height_thresh: float = 0.15,        # 底部地面判定门槛 (Floor)
         ceiling_height_thresh: float = 0.80,      # 顶部天花板阈值 (Ceiling)
         drop_dt_sec: float = 1.0,                 # 跌落检测时间差 (s)

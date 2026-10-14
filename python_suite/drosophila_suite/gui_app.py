@@ -1463,7 +1463,7 @@ class MainWindow(QMainWindow):
         self.spin_speed_ratio = QDoubleSpinBox()
         self.spin_speed_ratio.setRange(0.05, 1.0)
         self.spin_speed_ratio.setSingleStep(0.05)
-        self.spin_speed_ratio.setValue(0.25)
+        self.spin_speed_ratio.setValue(0.05)
         h_ratio.addWidget(lbl_ratio)
         h_ratio.addWidget(self.spin_speed_ratio)
         vbox_b.addLayout(h_ratio)
@@ -1566,7 +1566,7 @@ class MainWindow(QMainWindow):
 
         # 同步最新的 5 项核心动力学参数
         self.spin_gas_onset.setValue(float(getattr(self.config, "anesthesia_onset_time", 300.0)))
-        self.spin_speed_ratio.setValue(float(getattr(self.config, "sedate_speed_ratio", 0.25)))
+        self.spin_speed_ratio.setValue(float(getattr(self.config, "sedate_speed_ratio", 0.05)))
         self.spin_drop_thresh.setValue(float(getattr(self.config, "sedate_drop_speed", 0.95)))
         self.spin_still_sec.setValue(int(getattr(self.config, "anesthesia_still_sec", 120.0)))
         self.spin_speed_thresh.setValue(float(getattr(self.config, "anesthesia_speed_thresh", 1.00)))

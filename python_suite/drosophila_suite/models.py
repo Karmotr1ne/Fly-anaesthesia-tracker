@@ -36,7 +36,7 @@ class PipelineConfig:
     grid_order: str = "column_first"
 
     # ====== 新增：三阶段状态机参数 ======
-    sedate_speed_ratio: float = 0.35       # 速度低于基准 35% 计为镇静
+    sedate_speed_ratio: float = 0.05       # 速度低于基准 5% 计为镇静
     sedate_drop_speed: float = 0.25        # 1s 内 norm_height 跌落差门限
     anesthesia_still_sec: float = 120.0    # 连续静止 120s 计为麻醉深度击倒
     anesthesia_onset_time: float = 300.0  # Gas onset time in seconds
