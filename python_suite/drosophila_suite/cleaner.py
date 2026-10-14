@@ -8,7 +8,7 @@ Robust kinematic filtering algorithm for Drosophila chamber tracking:
 4. Normalized vertical coordinate (0.0=bottom ground, 1.0=top ceiling) and speed metrics.
 """
 
-from typing import Optional
+from typing import Optional, cast
 import numpy as np
 import pandas as pd
 from scipy.signal import savgol_filter
@@ -60,6 +60,10 @@ class KinematicCleaner:
         savgol_window: int = 7,
         savgol_poly: int = 2,
     ):
+        if not np.isfinite(fps) or fps <= 0:
+            raise ValueError("fps must be finite and positive")
+        if savgol_poly < 0 or savgol_window <= savgol_poly:
+            raise ValueError("savgol_window must exceed non-negative savgol_poly")
         self.fps = fps
         self.max_speed = max_speed_px
         self.dist_thresh = body_len_thresh * body_len_px
@@ -79,11 +83,11 @@ class KinematicCleaner:
             grp = group.copy().sort_values("frame").reset_index(drop=True)
 
             if "timestamp_s" not in grp.columns:
-                grp["timestamp_s"] = grp["frame"] / self.fps
+                grp["timestamp_s"] = grp["timestamp"] if "timestamp" in grp.columns else grp["frame"] / self.fps
 
             valid_x = grp["x_px"].dropna()
             valid_y = grp["y_px"].dropna()
-            if len(valid_x) < 15:
+            if len(valid_x) < 15 or len(valid_y) < 15:
                 continue
 
             # 1. 物理管腔 1% ~ 99% 分位数基线
@@ -104,8 +108,8 @@ class KinematicCleaner:
             grp.loc[step_dist > self.max_speed, ["x_px", "y_px"]] = np.nan
 
             # 4. 缺失数据锚定中点填充
-            grp["x_px"] = fill_missing_with_midpoints(grp["x_px"])
-            grp["y_px"] = fill_missing_with_midpoints(grp["y_px"])
+            grp["x_px"] = fill_missing_with_midpoints(cast(pd.Series, grp["x_px"]))
+            grp["y_px"] = fill_missing_with_midpoints(cast(pd.Series, grp["y_px"]))
 
             # 5. Savitzky-Golay 平滑
             if len(grp) > self.savgol_window:
@@ -127,6 +131,8 @@ class KinematicCleaner:
 
             cleaned_dfs.append(grp)
 
+        if not cleaned_dfs:
+            raise ValueError("No chamber has at least 15 valid x/y tracking samples")
         return pd.concat(cleaned_dfs, ignore_index=True).sort_values(["frame", "chamber_id"])
 
 

@@ -39,6 +39,14 @@ class PipelineConfig:
     sedate_speed_ratio: float = 0.35       # 速度低于基准 35% 计为镇静
     sedate_drop_speed: float = 0.25        # 1s 内 norm_height 跌落差门限
     anesthesia_still_sec: float = 120.0    # 连续静止 120s 计为麻醉深度击倒
+    anesthesia_onset_time: float = 300.0  # Gas onset time in seconds
+    gas_mixing_window_sec: float = 10.0
+    sedation_conf_thresh: float = 0.60
+    baseline_quantile: float = 0.75
+    floor_height_thresh: float = 0.05
+    ceiling_height_thresh: float = 0.95
+    drop_dt_sec: float = 1.0
+    rebound_horizon_sec: float = 50.0
     anesthesia_speed_thresh: float = 0.1   # 麻醉静止速度门槛 (px/s)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -94,7 +102,7 @@ class PipelineConfig:
             else:
                 data = yaml.safe_load(source)
         else:
-            content = source
+            content = str(source)
             if isinstance(source, Path) or (isinstance(source, str) and os.path.exists(source)):
                 with open(source, "r", encoding="utf-8") as f:
                     content = f.read()

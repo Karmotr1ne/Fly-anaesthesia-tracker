@@ -150,7 +150,7 @@ class RobustGridAligner:
                 roi_y2 = min(img_h, by2 + pad_y)
 
                 strip = gray[roi_y1:roi_y2, core_x1:core_x2]
-                vert_prof = np.mean(strip, axis=1)
+                vert_prof = np.mean(np.asarray(strip, dtype=np.float64), axis=1)
                 smooth_prof = cv2.GaussianBlur(vert_prof.reshape(-1, 1), (1, 9), 0).ravel()
                 grad_y = np.gradient(smooth_prof)
 
@@ -213,7 +213,7 @@ class RobustGridAligner:
             strip_x1, strip_x2 = max(0, strip_x1), min(img_w, strip_x2)
 
             if strip_x2 > strip_x1:
-                vert_profile = np.mean(gray[:, strip_x1:strip_x2], axis=1)
+                vert_profile = np.mean(np.asarray(gray[:, strip_x1:strip_x2], dtype=np.float64), axis=1)
                 smooth_prof = cv2.GaussianBlur(vert_profile.reshape(-1, 1), (1, 21), 0).ravel()
 
                 ch1_center_y = (y1 + y2) // 2
@@ -250,7 +250,7 @@ class RobustGridAligner:
 
             if (seam_search_x2 > seam_search_x1) and (sample_y2 > sample_y1):
                 vert_seam_strip = gray[sample_y1:sample_y2, seam_search_x1:seam_search_x2]
-                col_prof = np.mean(vert_seam_strip, axis=0)
+                col_prof = np.mean(np.asarray(vert_seam_strip, dtype=np.float64), axis=0)
                 smooth_col = cv2.GaussianBlur(col_prof.reshape(1, -1), (1, 11), 0).ravel()
                 valley_rel_x = int(np.argmin(smooth_col))
                 grad_col = np.gradient(smooth_col)
@@ -648,7 +648,7 @@ class Interactive8ChamberCalibrator:
             sy2 = min(self.img_h, by2 + int(bh * 0.4))
             v_crop = gray[sy1:sy2, bx1:bx2]
             if v_crop.size > 0:
-                v_prof = np.mean(v_crop, axis=1)
+                v_prof = np.mean(np.asarray(v_crop, dtype=np.float64), axis=1)
                 v_smooth = cv2.GaussianBlur(v_prof.reshape(-1, 1), (15, 1), 0).ravel()
                 bright_thresh = np.percentile(v_smooth, 35)
                 valid_y = np.where(v_smooth >= bright_thresh)[0]
@@ -667,4 +667,4 @@ class Interactive8ChamberCalibrator:
 
     def run(self) -> List[Tuple[int, int, int, int]]:
         self.auto_snap_chambers()
-        return [tuple(b) for b in self.boxes]
+        return [(b[0], b[1], b[2], b[3]) for b in self.boxes]

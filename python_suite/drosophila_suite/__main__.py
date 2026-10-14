@@ -16,11 +16,13 @@ if package_dir not in sys.path:
     sys.path.insert(0, package_dir)
 
 from drosophila_suite.cli import main as cli_main
-from drosophila_suite.gui_app import run_gui
 
 
 def main():
     if len(sys.argv) == 1 or "--gui" in sys.argv:
+        from drosophila_suite.gui_app import run_gui
+        if "--gui" in sys.argv:
+            sys.argv.remove("--gui")
         run_gui()
     else:
         cli_main()

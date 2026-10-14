@@ -10,47 +10,90 @@ import os
 import re
 import sys
 import time
-from typing import Dict, List, Tuple, Optional, Any
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Any, cast
 from enum import Enum
 import pandas as pd
 import numpy as np
 
-try:
-    from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QObject, QRunnable, QThreadPool, QPointF, QRectF
-    from PyQt6.QtGui import QImage, QColor, QPen, QPainter, QFont, QBrush, QCursor, QKeySequence, QShortcut
-    from PyQt6.QtWidgets import (
-        QApplication,
-        QMainWindow,
-        QDialog,
-        QWidget,
-        QVBoxLayout,
-        QHBoxLayout,
-        QLabel,
-        QPushButton,
-        QCheckBox,
-        QGroupBox,
-        QListWidget,
-        QMessageBox,
-        QFrame,
-        QFileDialog,
-        QSpinBox,
-        QDoubleSpinBox,
-        QRadioButton,
-        QComboBox,
-        QScrollArea,
-    )
-except ImportError:
-    pass
+# ---------------------------------------------------------------------
+# 1. Qt 环境变量安全配置与 PyQt6 导入
+# ---------------------------------------------------------------------
+# 避免 opencv-python 的精简版 Qt 插件覆盖系统/conda 环境中的平台插件
+if "QT_QPA_PLATFORM_PLUGIN_PATH" in os.environ:
+    del os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"]
+
+from PyQt6.QtCore import (
+    Qt,
+    pyqtSignal,
+    pyqtSlot,
+    QObject,
+    QRunnable,
+    QThreadPool,
+    QPointF,
+    QRectF,
+)
+from PyQt6.QtGui import (
+    QImage,
+    QColor,
+    QPen,
+    QPainter,
+    QFont,
+    QBrush,
+    QCursor,
+    QKeySequence,
+    QShortcut,
+    QMouseEvent,
+    QKeyEvent,
+    QPaintEvent,
+    QDragEnterEvent,
+    QDragLeaveEvent,
+    QDropEvent,
+)
+from PyQt6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QDialog,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QCheckBox,
+    QGroupBox,
+    QListWidget,
+    QMessageBox,
+    QFrame,
+    QFileDialog,
+    QSpinBox,
+    QDoubleSpinBox,
+    QRadioButton,
+    QComboBox,
+    QScrollArea,
+)
 
 import cv2
 
+# ---------------------------------------------------------------------
+# 2. 动态路径修复与自适应模块导入 (支持作为脚本独立运行或作为包导入)
+# ---------------------------------------------------------------------
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+_parent_dir = os.path.dirname(_current_dir)
+
+# 确保当前包目录与项目根目录均优先注册进 sys.path
+for _path in [_current_dir, _parent_dir]:
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
+# 显式自适应导入业务组件，避免 relative import with no known parent package
 try:
-    from .pipeline import DrosophilaBehaviorPipeline
-    from .models import PipelineConfig
-    from .cleaner import KinematicCleaner
-    from .anesthesia import AnesthesiaAnalyzer
-    from .visualizer import ScientificVisualizer
-    from .tracker import (
+    # 方式 1: 正常作为 drosophila_suite 包的一部分被导入
+    from drosophila_suite.pipeline import DrosophilaBehaviorPipeline
+    from drosophila_suite.models import PipelineConfig
+    from drosophila_suite.cleaner import KinematicCleaner
+    from drosophila_suite.anesthesia import AnesthesiaAnalyzer
+    from drosophila_suite.visualizer import ScientificVisualizer
+    from drosophila_suite.tracker import (
         RobustGridAligner,
         SymmetricGridAligner,
         Interactive8ChamberCalibrator,
@@ -59,17 +102,14 @@ try:
         get_video_metadata,
     )
 except (ImportError, ValueError):
-    cur_dir = os.path.dirname(os.path.abspath(__file__))
-    parent_dir = os.path.dirname(cur_dir)
-    if parent_dir not in sys.path:
-        sys.path.insert(0, parent_dir)
     try:
-        from drosophila_suite.pipeline import DrosophilaBehaviorPipeline
-        from drosophila_suite.models import PipelineConfig
-        from drosophila_suite.cleaner import KinematicCleaner
-        from drosophila_suite.anesthesia import AnesthesiaAnalyzer
-        from drosophila_suite.visualizer import ScientificVisualizer
-        from drosophila_suite.tracker import (
+        # 方式 2: 在当前目录直接以顶级脚本运行 (同级单文件模式)
+        from pipeline import DrosophilaBehaviorPipeline
+        from models import PipelineConfig
+        from cleaner import KinematicCleaner
+        from anesthesia import AnesthesiaAnalyzer
+        from visualizer import ScientificVisualizer
+        from tracker import (
             RobustGridAligner,
             SymmetricGridAligner,
             Interactive8ChamberCalibrator,
@@ -77,8 +117,21 @@ except (ImportError, ValueError):
             FlyVisionTracker,
             get_video_metadata,
         )
-    except ImportError:
-        pass
+    except (ImportError, ValueError):
+        # 方式 3: 相对导入回退保底
+        from .pipeline import DrosophilaBehaviorPipeline
+        from .models import PipelineConfig
+        from .cleaner import KinematicCleaner
+        from .anesthesia import AnesthesiaAnalyzer
+        from .visualizer import ScientificVisualizer
+        from .tracker import (
+            RobustGridAligner,
+            SymmetricGridAligner,
+            Interactive8ChamberCalibrator,
+            RobustFlyTracker,
+            FlyVisionTracker,
+            get_video_metadata,
+        )
 
 
 class SessionPhase(str, Enum):
@@ -91,7 +144,6 @@ class SessionPhase(str, Enum):
     RENDERING = "Rendering Overlay Video"
     COMPLETED = "Completed"
     FAILED = "Failed"
-
 
 # =====================================================================
 # Drag & Drop File Import Area
@@ -117,32 +169,74 @@ class DragDropArea(QFrame):
         self.setLayout(layout)
         self.all_files = []
 
-    def mousePressEvent(self, event):
-        files, _ = QFileDialog.getOpenFileNames(
+    def mousePressEvent(self, a0: Optional[QMouseEvent]) -> None:
+        if a0 is None:
+            return
+        event = a0
+        # 弹窗允许用户选择文件或选择整个文件夹目录递归
+        choice = QMessageBox.question(
             self,
-            "Select Experiment Files",
-            "",
-            "Experiment Data (*.csv *.mp4 *.avi *.mov *.mkv);;All Files (*.*)",
+            "Import Mode",
+            "Do you want to recursively scan an entire folder and its subdirectories?\n"
+            "(Click 'Yes' for Folder Tree, 'No' for Individual Files)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel
         )
-        if files:
-            for f in files:
-                if f not in self.all_files:
-                    self.all_files.append(f)
-            self.filesChanged.emit(self.all_files)
+        if choice == QMessageBox.StandardButton.Yes:
+            folder = QFileDialog.getExistingDirectory(self, "Select Root Directory with Deep Subfolders")
+            if folder:
+                self.scan_folder_recursive(folder)
+        elif choice == QMessageBox.StandardButton.No:
+            files, _ = QFileDialog.getOpenFileNames(
+                self,
+                "Select Experiment Files",
+                "",
+                "Experiment Data (*.csv *.mp4 *.avi *.mov *.mkv);;All Files (*.*)",
+            )
+            if files:
+                for f in files:
+                    if f not in self.all_files:
+                        self.all_files.append(f)
+                self.filesChanged.emit(self.all_files)
 
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
+    def scan_folder_recursive(self, root_dir: str):
+        """递归检索子目录下所有匹配的多媒体与轨迹文件"""
+        valid_exts = {".mp4", ".avi", ".mov", ".mkv", ".csv"}
+        for dirpath, _, filenames in os.walk(root_dir):
+            for fname in filenames:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext in valid_exts:
+                    full_p = os.path.join(dirpath, fname)
+                    if full_p not in self.all_files:
+                        self.all_files.append(full_p)
+        self.filesChanged.emit(self.all_files)
+
+    def dragEnterEvent(self, a0: Optional[QDragEnterEvent]) -> None:
+        if a0 is None:
+            return
+        event = a0
+        mime_data = event.mimeData()
+        if mime_data is not None and mime_data.hasUrls():
             event.accept()
             self.setStyleSheet(self.active_style)
         else:
             event.ignore()
 
-    def dragLeaveEvent(self, event):
+    def dragLeaveEvent(self, a0: Optional[QDragLeaveEvent]) -> None:
+        if a0 is None:
+            return
+        event = a0
         self.setStyleSheet(self.default_style)
 
-    def dropEvent(self, event):
+    def dropEvent(self, a0: Optional[QDropEvent]) -> None:
+        if a0 is None:
+            return
+        event = a0
         self.setStyleSheet(self.default_style)
-        urls = event.mimeData().urls()
+        mime_data = event.mimeData()
+        if mime_data is None:
+            event.ignore()
+            return
+        urls = mime_data.urls()
         new_files = [u.toLocalFile() for u in urls if u.toLocalFile()]
         for f in new_files:
             if f not in self.all_files:
@@ -234,6 +328,8 @@ class TrackingOnlyWorker(QRunnable):
                     self.signals.progress.emit(processed, total_sessions, msg)
 
             try:
+                if not ch_rois:
+                    raise ValueError(f"No chamber ROIs available for video: {vid_path}")
                 tracker = FlyVisionTracker(chamber_rois=ch_rois)
                 raw_df = tracker.track_video(vid_path, progress_callback=on_frame_progress)
 
@@ -275,7 +371,7 @@ class InteractiveChamberCanvas(QWidget):
         super().__init__(parent)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.sample_frame = None
+        self.sample_frame: Optional[np.ndarray] = None
         self.cached_gray = None
         self.cached_qimage_base = None
         self.boxes: List[List[int]] = []
@@ -334,7 +430,7 @@ class InteractiveChamberCanvas(QWidget):
         if self.sample_frame is not None:
             rgb_base = np.ascontiguousarray(cv2.cvtColor(self.sample_frame, cv2.COLOR_BGR2RGB))
             h, w, ch = rgb_base.shape
-            self.cached_qimage_base = QImage(rgb_base.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
+            self.cached_qimage_base = QImage(rgb_base.tobytes(), w, h, ch * w, QImage.Format.Format_RGB888).copy()
 
         self.boxes = [list(b) for b in boxes]
         self.rows = rows
@@ -367,7 +463,7 @@ class InteractiveChamberCanvas(QWidget):
             return
         gray = self.cached_gray if self.cached_gray is not None else cv2.cvtColor(self.sample_frame, cv2.COLOR_BGR2GRAY)
         tracker = RobustFlyTracker(
-            chamber_rois=[tuple(b) for b in self.boxes],
+            chamber_rois=[(b[0], b[1], b[2], b[3]) for b in self.boxes],
             diff_thresh=self.diff_thresh,
         )
         _, detections = tracker.process_frame(gray, 0, 0.0)
@@ -437,7 +533,10 @@ class InteractiveChamberCanvas(QWidget):
 
         return None, -1
 
-    def mousePressEvent(self, event):
+    def mousePressEvent(self, a0: Optional[QMouseEvent]) -> None:
+        if a0 is None:
+            return
+        event = a0
         self.setFocus()
         if event.button() == Qt.MouseButton.LeftButton:
             cx, cy = event.position().x(), event.position().y()
@@ -493,7 +592,10 @@ class InteractiveChamberCanvas(QWidget):
             self.drag_initial_boxes = [list(b) for b in self.boxes]
             self.update()
 
-    def mouseMoveEvent(self, event):
+    def mouseMoveEvent(self, a0: Optional[QMouseEvent]) -> None:
+        if a0 is None:
+            return
+        event = a0
         cx, cy = event.position().x(), event.position().y()
 
         if self.is_drawing_first and self.draw_start_point:
@@ -607,9 +709,12 @@ class InteractiveChamberCanvas(QWidget):
                 "resize_bl": Qt.CursorShape.SizeBDiagCursor,
                 "move": Qt.CursorShape.SizeAllCursor,
             }
-            self.setCursor(QCursor(cursor_map.get(action, Qt.CursorShape.ArrowCursor)))
+            self.setCursor(QCursor(cursor_map.get(action, Qt.CursorShape.ArrowCursor) if action is not None else Qt.CursorShape.ArrowCursor))
 
-    def mouseReleaseEvent(self, event):
+    def mouseReleaseEvent(self, a0: Optional[QMouseEvent]) -> None:
+        if a0 is None:
+            return
+        event = a0
         if self.is_drawing_first and self.current_drawing_rect:
             x1, y1, x2, y2 = self.current_drawing_rect
             if (x2 - x1) >= self.MIN_WIDTH and (y2 - y1) >= self.MIN_HEIGHT:
@@ -665,7 +770,10 @@ class InteractiveChamberCanvas(QWidget):
             self._update_fly_detections()
             self.update()
 
-    def keyPressEvent(self, event):
+    def keyPressEvent(self, a0: Optional[QKeyEvent]) -> None:
+        if a0 is None:
+            return
+        event = a0
         if event.key() == Qt.Key.Key_Z and (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
             self.undo()
             return
@@ -701,7 +809,10 @@ class InteractiveChamberCanvas(QWidget):
         self._update_fly_detections()
         self.update()
 
-    def paintEvent(self, event):
+    def paintEvent(self, a0: Optional[QPaintEvent]) -> None:
+        if a0 is None:
+            return
+        event = a0
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
@@ -780,8 +891,9 @@ class InteractiveChamberCanvas(QWidget):
                 painter.setPen(QColor("#FDE68A"))
                 painter.drawText(int(rx1 + 56), int(ry1 + 17), f"{int(x2 - x1)}x{int(y2 - y1)} px")
 
-            if cid in self.fly_centroids and self.fly_centroids[cid] is not None:
-                fx, fy = self.fly_centroids[cid]
+            centroid = self.fly_centroids.get(cid)
+            if centroid is not None:
+                fx, fy = centroid
                 cfx, cfy = self.img_to_canvas(fx, fy)
                 painter.setPen(QPen(QColor("#22C55E"), 1))
                 painter.drawLine(int(cfx - 7), int(cfy), int(cfx + 7), int(cfy))
@@ -820,13 +932,13 @@ class ChamberCalibrationDialog(QDialog):
         self.setWindowTitle(f"Multi-Chamber Grid Calibrator - {os.path.basename(video_path)}")
         self.resize(1140, 740)
         self.video_path = video_path
-        self.sample_frame = None
+        self.sample_frame: Optional[np.ndarray] = None
         self.order = order
-        self.last_first_box = None
+        self.last_first_box: Optional[Tuple[int, int, int, int]] = None
 
         if initial_chambers and len(initial_chambers) > 0:
             self.boxes = [list(b) for b in initial_chambers]
-            self.last_first_box = tuple(self.boxes[0])
+            self.last_first_box = (self.boxes[0][0], self.boxes[0][1], self.boxes[0][2], self.boxes[0][3])
             if len(self.boxes) != (rows * cols):
                 self.rows = rows
                 self.cols = max(1, len(self.boxes) // rows)
@@ -839,6 +951,7 @@ class ChamberCalibrationDialog(QDialog):
             self.cols = max(1, cols)
 
         self._load_video_sample()
+        assert self.sample_frame is not None
         self._setup_ui()
 
         self.undo_shortcut = QShortcut(QKeySequence.StandardKey.Undo, self)
@@ -1046,8 +1159,10 @@ class ChamberCalibrationDialog(QDialog):
     def _rebuild_chamber_buttons(self):
         while self.grid_ch.count():
             item = self.grid_ch.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            if item is not None:
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
         self.ch_buttons = []
         for i in range(len(self.canvas.boxes)):
             cid = i + 1
@@ -1067,13 +1182,13 @@ class ChamberCalibrationDialog(QDialog):
     def _on_canvas_box_changed(self):
         self.boxes = self.canvas.boxes
         if len(self.boxes) > 0:
-            self.last_first_box = tuple(self.boxes[0])
+            self.last_first_box = (self.boxes[0][0], self.boxes[0][1], self.boxes[0][2], self.boxes[0][3])
 
     def _set_mode(self, mode: str):
         self.canvas.link_mode = mode
 
     def get_chambers(self) -> List[Tuple[int, int, int, int]]:
-        return [tuple(b) for b in self.canvas.boxes]
+        return [(b[0], b[1], b[2], b[3]) for b in self.canvas.boxes]
 
 
 # =====================================================================
@@ -1081,13 +1196,14 @@ class ChamberCalibrationDialog(QDialog):
 # =====================================================================
 class PipelineBatchWorker(QRunnable):
     """
-    Worker for end-to-end full pipeline execution (Modules 1 to 5).
+    异步批处理线程：驱动完整的行为学端到端流水线 (Modules 1~5)
+    支持多 Session 深层子目录原位隔离输出，防止文件重名覆盖。
     """
     def __init__(
         self,
         matched_pairs: Dict[str, dict],
         config: PipelineConfig,
-        anesthesia_onset_time: float = 0.0,
+        anesthesia_onset_time: float = 300.0,
         save_raw_csv: bool = True,
         save_cleaned_csv: bool = True,
         generate_plots: bool = True,
@@ -1096,7 +1212,7 @@ class PipelineBatchWorker(QRunnable):
         super().__init__()
         self.matched_pairs = matched_pairs
         self.config = config
-        self.anesthesia_onset_time = anesthesia_onset_time
+        self.anesthesia_onset_time = float(anesthesia_onset_time)
         self.save_raw_csv = save_raw_csv
         self.save_cleaned_csv = save_cleaned_csv
         self.generate_plots = generate_plots
@@ -1112,60 +1228,93 @@ class PipelineBatchWorker(QRunnable):
         total_sessions = len(self.matched_pairs)
         processed = 0
         all_results = {}
+
+        # 确保配置中的通气时间与用户设置对齐
+        self.config.anesthesia_onset_time = self.anesthesia_onset_time
         pipeline = DrosophilaBehaviorPipeline(self.config)
 
-        for idx, (base, paths) in enumerate(self.matched_pairs.items(), start=1):
+        for idx, (session_key, paths) in enumerate(self.matched_pairs.items(), start=1):
             if self._is_cancelled:
                 self.signals.progress.emit(
                     processed, total_sessions, f"[{SessionPhase.IDLE.value}] Batch job cancelled ({idx}/{total_sessions})."
                 )
                 break
 
-            has_csv = bool(paths.get("csv") and os.path.exists(paths.get("csv")))
-            has_vid = bool(paths.get("video") and os.path.exists(paths.get("video")))
+            csv_file = paths.get("csv")
+            vid_file = paths.get("video")
+            has_csv = bool(csv_file and os.path.exists(csv_file))
+            has_vid = bool(vid_file and os.path.exists(vid_file))
+
+            # 1. 安全校验：如果既没有有效视频，也没有有效轨迹 CSV，跳过该项
+            if not has_csv and not has_vid:
+                err_msg = f"No valid video or CSV file found for session: {session_key}"
+                self.signals.error.emit(session_key, err_msg)
+                continue
+
+            # 2. 确定该 Session 的目标输出目录（严格输出在自身 recordings 目录下）
+            session_out_dir = paths.get("out_dir")
+            if not session_out_dir or not os.path.exists(session_out_dir):
+                if has_vid and vid_file is not None:
+                    session_out_dir = os.path.dirname(os.path.abspath(vid_file))
+                elif has_csv and csv_file is not None:
+                    session_out_dir = os.path.dirname(os.path.abspath(csv_file))
+                else:
+                    session_out_dir = "."
+            os.makedirs(session_out_dir, exist_ok=True)
+
+            # 3. 确定文件基名 (base_name)
+            # 使用原生的 raw_video（如果独立在子目录）或保留唯一前缀，避免多层重名 Session_xxx_Session_xxx
+            actual_base_name = paths.get("base_name") or session_key
 
             init_action = "Analyzing CSV" if has_csv else "Tracking Video"
             self.signals.progress.emit(
-                processed, total_sessions, f"[{init_action}] {base} ({idx}/{total_sessions})..."
+                processed, total_sessions, f"[{init_action}] {session_key} ({idx}/{total_sessions})..."
             )
 
             try:
                 ch_rois = paths.get("chamber_rois")
-                if not has_csv and has_vid and not ch_rois:
-                    cap = cv2.VideoCapture(paths["video"])
+                # 若无 CSV 且无 ROI 标定，则自适应生成对称初始网格
+                if not has_csv and has_vid and vid_file is not None and not ch_rois:
+                    cap = cv2.VideoCapture(vid_file)
                     ret, frame = cap.read()
                     cap.release()
                     if ret and frame is not None:
                         chamber_configs = SymmetricGridAligner.generate_symmetric_chambers(
                             frame_shape=frame.shape,
-                            rows=self.config.grid_rows,
-                            cols=self.config.grid_cols,
-                            order=self.config.grid_order,
+                            rows=getattr(self.config, 'grid_rows', 4),
+                            cols=getattr(self.config, 'grid_cols', 2),
+                            order=getattr(self.config, 'grid_order', 'column_first'),
                         )
                         ch_rois = [c["roi"] for c in chamber_configs]
 
                 def on_tracking_progress(f_cur, f_tot):
+                    if self._is_cancelled:
+                        return
                     if f_tot > 0 and (f_cur % 15 == 0 or f_cur == f_tot):
                         pct = int((f_cur / f_tot) * 100)
                         self.signals.progress.emit(
                             processed,
                             total_sessions,
-                            f"[{SessionPhase.TRACKING.value}] {base}: {pct}% ({f_cur}/{f_tot} frames)"
+                            f"[{SessionPhase.TRACKING.value}] {session_key}: {pct}% ({f_cur}/{f_tot} frames)"
                         )
 
                 def on_rendering_progress(f_cur, f_tot):
+                    if self._is_cancelled:
+                        return
                     if f_tot > 0 and (f_cur % 10 == 0 or f_cur == f_tot):
                         pct = int((f_cur / f_tot) * 100)
                         self.signals.progress.emit(
                             processed,
                             total_sessions,
-                            f"[{SessionPhase.RENDERING.value}] {base}: {pct}% ({f_cur}/{f_tot} frames)"
+                            f"[{SessionPhase.RENDERING.value}] {session_key}: {pct}% ({f_cur}/{f_tot} frames)"
                         )
 
+                # 调用流水线处理单组会话
                 res = pipeline.process_file_pair(
-                    csv_path=paths.get("csv"),
-                    video_path=paths.get("video"),
-                    base_name=base,
+                    csv_path=csv_file,
+                    video_path=vid_file,
+                    base_name=actual_base_name,
+                    output_dir=session_out_dir,
                     chamber_rois=ch_rois,
                     anesthesia_onset_time=self.anesthesia_onset_time,
                     save_raw_csv=self.save_raw_csv,
@@ -1175,21 +1324,21 @@ class PipelineBatchWorker(QRunnable):
                     progress_callback=on_tracking_progress,
                     render_progress_callback=on_rendering_progress
                 )
-                
-                all_results[base] = res
+
+                all_results[session_key] = res
                 processed += 1
-                self.signals.session_finished.emit(base, res)
+                self.signals.session_finished.emit(session_key, res)
                 self.signals.progress.emit(
-                    processed, total_sessions, f"[{SessionPhase.COMPLETED.value}] {base} ({processed}/{total_sessions})"
+                    processed, total_sessions, f"[{SessionPhase.COMPLETED.value}] {session_key} ({processed}/{total_sessions})"
                 )
+
             except Exception as e:
-                self.signals.error.emit(base, str(e))
+                self.signals.error.emit(session_key, str(e))
                 self.signals.progress.emit(
-                    processed, total_sessions, f"[{SessionPhase.FAILED.value}] Error on {base}"
+                    processed, total_sessions, f"[{SessionPhase.FAILED.value}] Error on {session_key}: {e}"
                 )
 
         self.signals.finished.emit(all_results)
-
 
 # =====================================================================
 # Main Application Window
@@ -1201,7 +1350,7 @@ class MainWindow(QMainWindow):
         self.resize(1180, 820)
         self.matched_pairs = {}
         self.config = PipelineConfig()
-        self.thread_pool = QThreadPool.globalInstance()
+        self.thread_pool = QThreadPool(self)
         self.current_worker = None
         self.setup_ui()
         self.sync_config_to_ui()
@@ -1290,25 +1439,25 @@ class MainWindow(QMainWindow):
         grp_a.setLayout(vbox_a)
         right_layout.addWidget(grp_a)
 
-        # Module 3: Kinetics & Gas Delivery Onset
-        grp_b = QGroupBox("Module 3:Gas Delivery Onset and Kinetics Thresholds")
+        # Module 3: Gas Delivery Onset and Kinetics Thresholds
+        grp_b = QGroupBox("Module 3: Gas Delivery Onset and Kinetics Thresholds")
         vbox_b = QVBoxLayout()
         vbox_b.setSpacing(6)
 
-        # 1. Anesthesia Gas Onset Time
+        # 1. 通气时间 (Anesthesia Gas Onset Time: 300.0 s)
         h_gas = QHBoxLayout()
         lbl_gas = QLabel("<b>Anesthesia Gas Onset Time:</b>")
         lbl_gas.setStyleSheet("color: #F59E0B; font-weight: bold;")
         self.spin_gas_onset = QDoubleSpinBox()
         self.spin_gas_onset.setRange(0.0, 10000.0)
-        self.spin_gas_onset.setSingleStep(5.0)
+        self.spin_gas_onset.setSingleStep(10.0)
         self.spin_gas_onset.setValue(300.0)
         self.spin_gas_onset.setSuffix(" s")
         h_gas.addWidget(lbl_gas)
         h_gas.addWidget(self.spin_gas_onset)
         vbox_b.addLayout(h_gas)
 
-        # 2. Sedate Speed Ratio (速度阈值 1)
+        # 2. 镇静降速比率 (Sedate Speed Ratio: 0.25)
         h_ratio = QHBoxLayout()
         lbl_ratio = QLabel("Sedate Speed Ratio:")
         self.spin_speed_ratio = QDoubleSpinBox()
@@ -1319,36 +1468,36 @@ class MainWindow(QMainWindow):
         h_ratio.addWidget(self.spin_speed_ratio)
         vbox_b.addLayout(h_ratio)
 
-        # 3. Sedate Drop Height (/1s) (掉落阈值窗口)
+        # 3. 相对跌落幅度百分比 (Sedate Drop Ratio (/1s): 0.75 = 75%)
         h_drop = QHBoxLayout()
-        lbl_drop = QLabel("Sedate Drop Height (/1s):")
+        lbl_drop = QLabel("Sedate Height Drop (ΔH in 1s):")
         self.spin_drop_thresh = QDoubleSpinBox()
-        self.spin_drop_thresh.setRange(0.05, 0.95)
+        self.spin_drop_thresh.setRange(0.10, 1.00)
         self.spin_drop_thresh.setSingleStep(0.05)
-        self.spin_drop_thresh.setValue(0.75)
+        self.spin_drop_thresh.setValue(0.75)       # Replaced by the configured normalized height drop in sync_config_to_ui
         h_drop.addWidget(lbl_drop)
         h_drop.addWidget(self.spin_drop_thresh)
         vbox_b.addLayout(h_drop)
 
-        # 4. Anaesthesia Still Window
+        # 4. 麻醉深度静止确认窗口 (Anaesthesia Still Window: 120 s)
         h_still = QHBoxLayout()
         lbl_still = QLabel("Anaesthesia Still Window:")
         self.spin_still_sec = QSpinBox()
-        self.spin_still_sec.setRange(10, 1200)
+        self.spin_still_sec.setRange(5, 600)
         self.spin_still_sec.setSingleStep(10)
-        self.spin_still_sec.setValue(120)
+        self.spin_still_sec.setValue(120)          # 预设 120s
         self.spin_still_sec.setSuffix(" s")
         h_still.addWidget(lbl_still)
         h_still.addWidget(self.spin_still_sec)
         vbox_b.addLayout(h_still)
 
-        # 5. Anaesthesia Speed Thresh (速度阈值 2)
+        # 5. 麻醉绝对静止速度门槛 (Anaesthesia Speed Thresh: 1.00 px/s)
         h_speed_thresh = QHBoxLayout()
         lbl_speed_thresh = QLabel("Anaesthesia Speed Thresh:")
         self.spin_speed_thresh = QDoubleSpinBox()
         self.spin_speed_thresh.setRange(0.01, 20.0)
-        self.spin_speed_thresh.setSingleStep(0.05)
-        self.spin_speed_thresh.setValue(0.10)
+        self.spin_speed_thresh.setSingleStep(0.5)
+        self.spin_speed_thresh.setValue(1.00)
         self.spin_speed_thresh.setSuffix(" px/s")
         h_speed_thresh.addWidget(lbl_speed_thresh)
         h_speed_thresh.addWidget(self.spin_speed_thresh)
@@ -1410,67 +1559,155 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(right_layout, 4)
 
     def sync_config_to_ui(self):
-        # 几何网格参数
         self.spin_rows.setValue(getattr(self.config, "grid_rows", 4))
         self.spin_cols.setValue(getattr(self.config, "grid_cols", 2))
         order_idx = 0 if getattr(self.config, "grid_order", "column_first") == "column_first" else 1
         self.combo_order.setCurrentIndex(order_idx)
 
-        # 动力学与麻醉判定 5 参数完整加载
-        self.spin_gas_onset.setValue(float(getattr(self.config, "anesthesia_onset_time", 0.0)))
-        self.spin_speed_ratio.setValue(float(getattr(self.config, "sedate_speed_ratio", 0.35)))
-        self.spin_drop_thresh.setValue(float(getattr(self.config, "sedate_drop_speed", 0.25)))
+        # 同步最新的 5 项核心动力学参数
+        self.spin_gas_onset.setValue(float(getattr(self.config, "anesthesia_onset_time", 300.0)))
+        self.spin_speed_ratio.setValue(float(getattr(self.config, "sedate_speed_ratio", 0.25)))
+        self.spin_drop_thresh.setValue(float(getattr(self.config, "sedate_drop_speed", 0.95)))
         self.spin_still_sec.setValue(int(getattr(self.config, "anesthesia_still_sec", 120.0)))
-        self.spin_speed_thresh.setValue(float(getattr(self.config, "anesthesia_speed_thresh", 0.10)))
+        self.spin_speed_thresh.setValue(float(getattr(self.config, "anesthesia_speed_thresh", 1.00)))
 
     def sync_ui_to_config(self):
-        # 几何网格参数
         self.config.grid_rows = self.spin_rows.value()
         self.config.grid_cols = self.spin_cols.value()
         self.config.grid_order = "column_first" if self.combo_order.currentIndex() == 0 else "row_first"
 
-        # 动力学与麻醉判定 5 参数完整持久化
+        # 持久化存储至 config
         self.config.anesthesia_onset_time = float(self.spin_gas_onset.value())
         self.config.sedate_speed_ratio = float(self.spin_speed_ratio.value())
         self.config.sedate_drop_speed = float(self.spin_drop_thresh.value())
         self.config.anesthesia_still_sec = float(self.spin_still_sec.value())
         self.config.anesthesia_speed_thresh = float(self.spin_speed_thresh.value())
 
-    def on_files_updated(self, files):
+    def on_files_updated(self, files: List[str]):
         self.pair_list.clear()
         self.matched_pairs = {}
-        csvs = [f for f in files if f.lower().endswith(".csv")]
-        vids = [f for f in files if f.lower().endswith((".mp4", ".avi", ".mov", ".mkv"))]
 
-        def extract_base_name(file_path: str) -> str:
-            name = os.path.splitext(os.path.basename(file_path))[0]
-            pattern = r"(_tracked|_raw|_cleaned|_v\d+|_overlay|_filtered)$"
-            while True:
-                new_name = re.sub(pattern, "", name, flags=re.IGNORECASE)
-                if new_name == name:
+        # 1. 过滤已有的结果/汇总/图表/合成视频文件黑名单，避免重复导入干扰
+        artifact_keywords = [
+            "_results_summary",
+            "_frames_meta",
+            "_summary",
+            "_meta",
+            "_activity_position",
+            "_kymograph_norm",
+            "_survival_kinetics",
+            "_overlay",
+            "_cleaned_overlay"
+        ]
+
+        # 2. 提取 Session 标签与清理后缀的辅助函数
+        def parse_file_info(file_path: str):
+            p = Path(file_path)
+            fname_lower = p.name.lower()
+            ext = p.suffix.lower()
+
+            # 过滤派生产物
+            if any(kw in fname_lower for kw in artifact_keywords):
+                return None
+
+            # 向上追溯目录提取类似 Session_20261012_095550 的时间后缀
+            session_tag = ""
+            for part in p.parts:
+                m = re.search(r"(Session_\d{8}_\d{6})", part, flags=re.IGNORECASE)
+                if m:
+                    session_tag = m.group(1)
                     break
-                name = new_name
-            return name.strip()
+                elif part.lower().startswith("session_"):
+                    session_tag = part
+                    break
 
-        csv_map = {extract_base_name(f): f for f in csvs}
-        vid_map = {extract_base_name(f): f for f in vids}
+            # 去除 _raw, _cleaned 等状态后缀，还原 base name
+            stem = p.stem
+            pattern = r"(_tracked|_raw|_cleaned|_v\d+|_filtered)$"
+            clean_stem = stem
+            while True:
+                new_stem = re.sub(pattern, "", clean_stem, flags=re.IGNORECASE)
+                if new_stem == clean_stem:
+                    break
+                clean_stem = new_stem
 
-        all_bases = sorted(set(csv_map.keys()) | set(vid_map.keys()))
-        for base in all_bases:
-            has_csv = base in csv_map
-            has_vid = base in vid_map
+            # 组合唯一 session ID (若有 session 目录则加上，防止多 session 同名覆盖)
+            unique_id = f"{session_tag}_{clean_stem}" if session_tag else clean_stem
+
+            return {
+                "unique_id": unique_id,
+                "session_tag": session_tag,
+                "clean_stem": clean_stem,
+                "folder_dir": str(p.parent),
+                "full_path": file_path,
+                "ext": ext,
+                "fname_lower": fname_lower
+            }
+
+        # 3. 按 Session 分组归类有效文件
+        grouped_sessions: Dict[str, Dict[str, Any]] = {}
+        for f in files:
+            info = parse_file_info(f)
+            if not info:
+                continue
+
+            uid = info["unique_id"]
+            if uid not in grouped_sessions:
+                grouped_sessions[uid] = {
+                    "session_tag": info["session_tag"],
+                    "base_name": info["clean_stem"],
+                    "video": None,
+                    "cleaned_csv": None,
+                    "raw_csv": None,
+                    "out_dir": info["folder_dir"]
+                }
+
+            ext = info["ext"]
+            fname_lower = info["fname_lower"]
+            full_path = info["full_path"]
+
+            if ext in {".mp4", ".avi", ".mov", ".mkv"}:
+                grouped_sessions[uid]["video"] = full_path
+            elif ext == ".csv":
+                if "_cleaned" in fname_lower:
+                    grouped_sessions[uid]["cleaned_csv"] = full_path
+                elif "_raw" in fname_lower:
+                    grouped_sessions[uid]["raw_csv"] = full_path
+                else:
+                    if not grouped_sessions[uid]["raw_csv"]:
+                        grouped_sessions[uid]["raw_csv"] = full_path
+
+        # 4. 判定各 Session 状态并呈现到界面列表
+        for uid in sorted(grouped_sessions.keys()):
+            s = grouped_sessions[uid]
+            primary_csv = s["cleaned_csv"] or s["raw_csv"]
+            has_csv = primary_csv is not None
+            has_vid = s["video"] is not None
+
             if has_csv and has_vid:
-                status = "[Paired] CSV + Video"
-                self.matched_pairs[base] = {"csv": csv_map[base], "video": vid_map[base]}
+                if s["cleaned_csv"]:
+                    status = "[Cleaned CSV Ready - Fast Track]"
+                else:
+                    status = "[Paired] CSV + Video"
             elif has_csv and not has_vid:
-                status = "[CSV Data Only]"
-                self.matched_pairs[base] = {"csv": csv_map[base], "video": None}
+                status = "[Cleaned CSV Only]" if s["cleaned_csv"] else "[Raw CSV Only]"
             elif not has_csv and has_vid:
                 status = "[Video Awaiting Tracking]"
-                self.matched_pairs[base] = {"csv": None, "video": vid_map[base]}
             else:
                 continue
-            self.pair_list.addItem(f"{base}  ->  {status}")
+
+            self.matched_pairs[uid] = {
+                "csv": primary_csv,
+                "video": s["video"],
+                "out_dir": s["out_dir"],
+                "base_name": s["base_name"],
+                "session_tag": s["session_tag"]
+            }
+            # 显示时带上时间后缀，清晰区分不同 Session
+            self.pair_list.addItem(f"{uid}  ->  {status}")
+
+        count = len(self.matched_pairs)
+        self.lbl_status.setText(f"Ready: Loaded {count} distinct experiment session(s).")
 
     def calibrate_selected_session(self):
         row = self.pair_list.currentRow()
@@ -1530,7 +1767,7 @@ class MainWindow(QMainWindow):
     def on_session_finished(self, base: str, res: dict):
         for idx in range(self.pair_list.count()):
             item = self.pair_list.item(idx)
-            if item.text().startswith(base):
+            if item is not None and item.text().startswith(base):
                 item.setText(f"{base}  ->  [Completed]")
                 break
 
@@ -1546,7 +1783,7 @@ class MainWindow(QMainWindow):
     def on_tracking_session_finished(self, base: str, res: dict):
         for idx in range(self.pair_list.count()):
             item = self.pair_list.item(idx)
-            if item.text().startswith(base):
+            if item is not None and item.text().startswith(base):
                 item.setText(f"{base}  ->  [Video Tracked: Raw CSV Generated]")
                 break
 

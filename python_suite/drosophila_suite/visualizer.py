@@ -7,7 +7,7 @@ Kymographs, annotated video overlays, and structured statistical reports.
 
 import os
 import time
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, cast
 import cv2
 import matplotlib
 matplotlib.use("Agg")  # Non-interactive backend for headless rendering & PyInstaller safety
@@ -57,7 +57,7 @@ class ScientificVisualizer:
             ax_pos = axes[i]        # Position axis (Right)
             ax_act = ax_pos.twinx() # Activity axis (Left)
 
-            sub = cleaned_df[cleaned_df["chamber_id"] == ch].sort_values("frame").reset_index(drop=True)
+            sub = cast(pd.DataFrame, cleaned_df[cleaned_df["chamber_id"] == ch]).sort_values("frame").reset_index(drop=True)
             
             if "timestamp_s" in sub.columns and sub["timestamp_s"].notna().sum() > 0:
                 time_sec = sub["timestamp_s"].to_numpy()
@@ -77,8 +77,8 @@ class ScientificVisualizer:
                     norm_pos = pd.Series(0.5, index=sub.index)
 
             # Activity / Smoothed Speed
-            speed_col = sub["speed"] if "speed" in sub.columns else pd.Series(0.0, index=sub.index)
-            smooth_speed = speed_col.rolling(window=15, min_periods=1, center=True).mean().fillna(0.0)
+            speed_col = cast(pd.Series, sub["speed"]) if "speed" in sub.columns else pd.Series(0.0, index=sub.index)
+            smooth_speed = pd.Series(speed_col.rolling(window=15, min_periods=1, center=True).mean(), index=sub.index).fillna(0.0)
 
             # 1. Plot Activity (Left axis - Cyan/Blue fill + line)
             ax_act.plot(time_sec, smooth_speed, color="#00A2E8", lw=1.2, label="Activity (px/s)", alpha=0.9)
@@ -282,8 +282,13 @@ class ScientificVisualizer:
         out_h = int(h * scale)
 
         os.makedirs(os.path.dirname(os.path.abspath(output_video_path)), exist_ok=True)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        fourcc = cv2.VideoWriter.fourcc(*"mp4v")
         writer = cv2.VideoWriter(output_video_path, fourcc, fps, (out_w, out_h))
+
+        if not writer.isOpened():
+            cap.release()
+            writer.release()
+            raise IOError(f"Cannot create output video: {output_video_path}")
 
         # Fast group indexing by frame
         frame_grouped = {f: grp for f, grp in cleaned_df.groupby("frame")}
@@ -300,14 +305,14 @@ class ScientificVisualizer:
 
                 if f_idx in frame_grouped:
                     grp = frame_grouped[f_idx]
-                    for _, row in grp.iterrows():
+                    for row in grp.to_dict(orient="records"):
                         x_col = "x_clean" if "x_clean" in row and pd.notna(row["x_clean"]) else "x_px"
                         y_col = "y_clean" if "y_clean" in row and pd.notna(row["y_clean"]) else "y_px"
                         
-                        if pd.notna(row.get(x_col)) and pd.notna(row.get(y_col)):
+                        if row.get(x_col) is not None and row.get(y_col) is not None and bool(pd.notna(row[x_col])) and bool(pd.notna(row[y_col])):
                             cx = int(round(float(row[x_col]) * scale))
                             cy = int(round(float(row[y_col]) * scale))
-                            ch_id = int(row.get("chamber_id", 0))
+                            ch_id = int(row["chamber_id"])
 
                             # Green core point
                             cv2.circle(frame, (cx, cy), 3, (0, 255, 0), -1, cv2.LINE_AA)
