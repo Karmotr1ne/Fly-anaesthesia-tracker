@@ -1,2 +1,5 @@
-/Scripts/
-/Fly-anaesthesia-release/
+__pycache__/
+*.py[cod]
+.venv/
+.vscode/
+workspace/
