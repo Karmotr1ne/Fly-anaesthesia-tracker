@@ -112,6 +112,6 @@ CLI 与桌面端使用同一评估服务 / CLI and GUI share the evaluation serv
 | 误识别或丢失 / False or missing detections | 检查 ROI、光照、背景采样和预览，再调整参数。 / Inspect ROIs, lighting, background sampling and previews before tuning parameters. |
 | Raw 未清洗 / Uncleaned Raw input | 先运行 Tracking，再使用 Position CSV 评估。 / Run Tracking first and evaluate the Position CSV. |
 
-文档依据源码整理，尚未进行完整硬件联调；正式实验前请检查代表性视频与输出结果。
+已在本地进行完整硬件联调；然而正式实验前请检查代表性视频与输出结果。
 
-This guide is based on source inspection, without full hardware validation. Inspect representative videos and outputs before running a full experimental batch.
+This programme has gone through hardware validation. Yet, inspect representative videos and outputs before running a full experimental batch.
