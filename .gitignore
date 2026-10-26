@@ -1,5 +1,9 @@
+/build.spec
+/dist/
+/build/
 __pycache__/
 *.py[cod]
 .venv/
 .vscode/
 workspace/
+/.release_check/

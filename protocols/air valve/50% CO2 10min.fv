@@ -1,0 +1,25 @@
+# FlowVision2 Protocol Control Script
+# Generated on: 2026-10-26 09:11:27
+[GasDeliveryControl]
+Port = COM3
+MixGasOnsetTime = 0
+Duration = 1800
+TotalSteps = 3
+
+[Step_1]
+Time = 300
+Unit_A_O2 = 100
+Unit_B_Anesthetics = 0
+Unit_C_N2 = 400
+
+[Step_2]
+Time = 600
+Unit_A_O2 = 100
+Unit_B_Anesthetics = 250
+Unit_C_N2 = 150
+
+[Step_3]
+Time = 900
+Unit_A_O2 = 100
+Unit_B_Anesthetics = 0
+Unit_C_N2 = 400

@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import (
 )
 
 from core.analysis.anaesthesia_analyser import AnaesthesiaParams
-from core.session.layout import session_root
+from core.session.layout import session_root, experiment_name
 from ui.widgets.drag_drop_zone import DragDropUploadArea
 from core.analysis.evaluation_jobs import EvaluationWorker, ArchiveWorker, SessionCheckWorker, EvaluationImportWorker
 
@@ -418,7 +418,7 @@ class UnifiedEvaluationTab(QWidget):
             self.table_results.setItem(idx, 0, chk_item)
 
             self.table_results.setItem(idx, 1, QTableWidgetItem(str(idx + 1)))
-            source_item = QTableWidgetItem(source_path.name)
+            source_item = QTableWidgetItem(experiment_name(source_path))
             source_item.setToolTip(str(source_path))
             self.table_results.setItem(idx, 2, source_item)
             self.table_results.setItem(idx, 3, QTableWidgetItem("Checking files..."))
@@ -473,6 +473,10 @@ class UnifiedEvaluationTab(QWidget):
                 item.setToolTip(result["tooltip"])
                 item.setForeground(QColor("#15803D" if result["complete"] else "#C2410C"))
                 self.table_results.setItem(row, 3, item)
+                if not (self.worker and self.worker.isRunning()):
+                    state_item = QTableWidgetItem(result.get('analysis_state', 'Not analysed'))
+                    state_item.setToolTip(result['tooltip'])
+                    self.table_results.setItem(row, 4, state_item)
                 self.table_results.resizeRowToContents(row)
                 break
 

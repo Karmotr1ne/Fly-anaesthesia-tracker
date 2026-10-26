@@ -1,0 +1,8 @@
+PyQt5>=5.15
+numpy
+pandas
+scipy
+opencv-python
+matplotlib
+psutil
+pyserial

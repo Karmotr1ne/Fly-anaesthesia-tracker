@@ -8,7 +8,7 @@ import re
 from core import schema
 from .file_matcher import (discover_and_match_sessions,
                            discover_tracking_videos, is_source_video, tracking_output_path, detection_path)
-from .layout import SessionPaths, dataset_name, session_root, temporary_path
+from .layout import SessionPaths, dataset_name, session_root, temporary_path, experiment_name
 
 
 def _identity(path):
@@ -30,6 +30,9 @@ def _video_for(source, context, videos):
         video.stem, dataset_name(tracking_output_path(video, session_root(source))))]
     if len(exact) == 1:
         return exact[0]
+    timed = [video for video in videos if experiment_name(video) == experiment_name(source)]
+    if len(timed) == 1:
+        return timed[0]
     # Legacy CSV names may not contain the modern video identity hash.
     # A unique acquisition video is safe; multiple videos stay unmatched.
     if len(videos) == 1 and videos[0].stem.casefold() == 'raw_video':
@@ -52,9 +55,11 @@ def discover_evaluation_inputs(paths, cancel_callback=None):
         if video_key in linked:
             continue
         expected = tracking_output_path(video, entry["session_dir"])
+        session_videos = [Path(item['video']) for item in videos.values()
+                          if item['session_dir'] == entry['session_dir']]
         existing = next((data for data in matched.values()
                          if session_root(Path(data["csv"])) == entry["session_dir"]
-                         and _video_for(Path(data["csv"]), data, [video]) == video), None)
+                         and _video_for(Path(data["csv"]), data, session_videos) == video), None)
         if existing is not None:
             existing["video"] = str(video)
             linked.add(video_key)
@@ -178,17 +183,43 @@ def inspect_session_assets(source_path, context=None, cache=None):
             finally:
                 capture.release()
         actual, tolerance = cache[video_key]
-        expected = snapshot["expected"]
-        video_state = ("Unreadable" if actual is None else "Unverified" if expected is None
-                       else "OK" if abs(actual - expected) <= tolerance
-                       else "Too short" if actual < expected else "Too long")
-    complete = log_state == position_state == raw_state == video_state == "OK"
+        video_state = "Unreadable" if actual is None else "OK"
+    analysis_id = experiment_name(source)
+    analysis_dir = SessionPaths(session).analysis
+    # Current concise names first; retain compatibility with old Position-prefixed outputs.
+    evaluated = next((path for path in (
+        analysis_dir / (analysis_id + '_evaluated.csv'),
+        analysis_dir / (source.stem + '_evaluated.csv'),
+        analysis_dir / ('Session_' + analysis_id + '_' + source.stem + '_evaluated.csv'))
+        if path.is_file()), analysis_dir / (analysis_id + '_evaluated.csv'))
+    summary = next((path for path in (
+        analysis_dir / (analysis_id + '_summary.csv'),
+        analysis_dir / (source.stem + '_summary.csv'),
+        analysis_dir / ('Session_' + analysis_id + '_' + source.stem + '_summary.csv'))
+        if path.is_file()), analysis_dir / (analysis_id + '_summary.csv'))
+    summary_valid = False
+    if summary.is_file():
+        try:
+            with summary.open(encoding='utf-8-sig', newline='') as stream:
+                reader = csv.reader(stream)
+                fields = {schema.field(name) for name in next(reader)}
+                summary_valid = 'chamber_id' in fields and bool(next(reader, None))
+        except (OSError, UnicodeError, StopIteration, csv.Error):
+            pass
+    evaluated_state = _csv_state(evaluated, processed=True)
+    analysis_state = ('Done' if evaluated_state == 'OK' and summary_valid else
+                      'Summary only' if summary_valid else
+                      'Incomplete' if evaluated.exists() or summary.exists() else 'Not analysed')
+    complete = position_state == raw_state == video_state == "OK"
     notes = [f"Session: {session}", "Logs: " + (", ".join(str(path) for path in snapshot["logs"]) or "missing"),
              f"Position CSV (cleaned trajectory): {position}",
              f"Raw CSV (unmodified detections): {required_raw}", f"Video: {video or 'unmatched'}", snapshot["protocol_note"]]
+    notes.extend((f'Analysis ID: {analysis_id}', f'Evaluated CSV: {evaluated}',
+                  f'Summary CSV: {summary}'))
     if snapshot["expected"] is not None:
         notes.append(f"Protocol duration: {snapshot['expected']:.3f} s")
     if actual is not None:
-        notes.append(f"Video duration: {actual:.3f} s; tolerance: {tolerance:.3f} s")
-    return {"text": f"Log: {log_state} | Video: {video_state} | Position: {position_state} | Raw: {raw_state}",
+        notes.append(f"Video duration: {actual:.3f} s")
+    return {"text": f"Video: {video_state} | Position: {position_state} | Raw: {raw_state} | Analysis: {analysis_state}",
+            "analysis_state": analysis_state, "analysis_id": analysis_id,
             "complete": complete, "tooltip": "\n".join(notes)}

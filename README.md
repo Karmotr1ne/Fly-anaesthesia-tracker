@@ -30,7 +30,7 @@ Use a Python environment supported by the dependencies. Source syntax requires P
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install PyQt5 numpy pandas scipy opencv-python matplotlib
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
 # 离线分析 / Offline analysis
 .\.venv\Scripts\python.exe main.py --no-hardware
@@ -50,11 +50,11 @@ The current GUI uses **PyQt5**. `--no-hardware` skips hardware connections at st
 | 项目 / Item | 默认值与设置 / Defaults & setup |
 | --- | --- |
 | 相机 / Camera | Basler + pylon 驱动及 `pypylon`；先确认相机可被 pylon 工具识别。 / Basler with pylon drivers and `pypylon`; verify detection in pylon tools first. |
-| PFS | 在 Acquisition → Browse 选择适合相机的 `.pfs`；默认引用的 PFS 未随源码提供。 / Select a camera-compatible `.pfs` via Acquisition → Browse; the default referenced file is not bundled. |
+| PFS | 相机预设扫描 `protocols/camera/`，也可通过 Acquisition → Browse 选择 `.pfs`。附带预设需要先核对相机型号。 / Camera presets are scanned from `protocols/camera/`; Browse also accepts a `.pfs`. Verify the bundled preset against your camera model. |
 | 帧率 / Frame rate | 录像默认 30 fps；核对相机实际输出、录像和分析 FPS。 / Recording defaults to 30 fps; verify camera, recording and analysis rates. |
 | 串口 / Serial | 默认 `COM3`、19200 baud、8N1；按实际端口修改并重连。 / Defaults to `COM3`, 19200 baud, 8N1; select the actual port and reconnect. |
 | MFC | A = O2，B = Anaesthetics，C = N2；单位 sccm，设定精度 0.1。B 的默认气体标签为 CO2，须核对实际接气和标定。 / A = O2, B = Anaesthetics, C = N2; sccm with 0.1 setpoint precision. B defaults to a CO2 label; verify gas connections and calibration. |
-| 协议 / Protocol | 在 Protocol 页面建立或导入 `.fv`，核对阶段时长、流量和混合气体起始时间。 / Create or import `.fv` protocols; check stage durations, flows and mix-gas onset. |
+| 协议 / Protocol | Protocol Library 扫描 `protocols/air valve/` 的 `.fv`；核对阶段时长、流量和混合气体起始时间。 / Protocol Library scans `.fv` files under `protocols/air valve/`; check stage durations, flows and mix-gas onset. |
 | 数据 / Storage | 默认写入 `workspace/sessions/`；确保空间充足并单独备份，该目录被 Git 忽略。 / Defaults to `workspace/sessions/`; allow sufficient disk space and back up separately, as Git ignores this directory. |
 
 硬件默认值见 `core/protocol/flowvision_model.py`，MFC 地址映射见 `core/hardware/protocol_scheduler.py`。当前串口实现使用字母地址和 ASCII 指令，其他型号需确认协议兼容。
@@ -85,13 +85,16 @@ Video-only recording requires a ready camera; synchronized experiments also requ
 
 ```text
 workspace/sessions/Session_<timestamp>_<flow>Anes_<duration>s/
-├── raw/       # 原始视频 / Original video
+├── raw/       # 原始视频、检测 CSV、Position CSV / Video, detections and Position CSV
 ├── logs/      # 遥测、协议、相机与分析配置 / Telemetry, protocol, camera & analysis settings
-└── analysis/  # 检测、轨迹、评估、汇总与可选图表 / Detections, trajectories, evaluation, summaries & optional plots
+└── analysis/  # 评估、汇总与可选图表 / Evaluation, summaries and optional plots
 ```
 
 - **输入 / Input** — `*_raw.csv` 是原始检测，`*_position.csv` 是清洗轨迹，评估优先使用后者。 / `*_raw.csv` contains raw detections; `*_position.csv` contains cleaned trajectories and is the preferred evaluation input.
 - **输出 / Output** — `*_evaluated.csv` 为逐帧评估，`*_summary.csv` 为汇总；追踪和评估参数保存在 `logs/`。 / `*_evaluated.csv` stores frame-level evaluation; `*_summary.csv` stores summaries. Tracking and evaluation settings are saved in `logs/`.
+- **命名 / Names** — 以实验时间 `YYYYMMDD_HHMMSS` 命名；每个视频完成即提交结果。集中提取的 Position CSV 在所在文件夹的 `analysis/` 输出结果。 / Files use the experiment timestamp; results commit per video. Extracted Position CSVs write to their folder's `analysis/` directory.
+- **图表 / Plots** — 方向运动图包含水平、竖直分速度与转向角速度；可额外输出箱线汇总图。 / Directional motion combines horizontal and vertical velocities with turning rate; optional box-and-whisker summaries are available.
+- **默认流量 / Default flows** — 最大总流量下的 O2:N2 = 1:4 只在启动或更改腔室设计时应用；保存或应用 Protocol 保留表内流量。 / Maximum-flow O2:N2 defaults apply only at startup or geometry changes; Save and Apply preserve edited flows.
 - **单位 / Units** — 坐标为像素，速度为 **px/s**，高度阈值为归一化值；不能直接把速度当作 mm/s。 / Coordinates are in pixels, speed in **px/s**, and height thresholds are normalized; speed is not calibrated to mm/s.
 - **阈值 / Thresholds** — 评估引擎默认气体起始 300 s、静止窗口 120 s、静止速度 0.1 px/s；应按实际实验调整。缺失检测不等于静止。 / Engine defaults are 300 s gas onset, a 120 s stillness window and 0.1 px/s stillness speed; adjust to the experiment. Missing detections do not imply stillness.
 

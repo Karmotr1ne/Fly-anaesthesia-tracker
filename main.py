@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QCloseEvent
+from PyQt5.QtGui import QCloseEvent, QIcon, QPixmap
 from PyQt5.QtWidgets import (
     QApplication, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
     QTabWidget, QVBoxLayout, QWidget,
@@ -23,6 +23,7 @@ from core.hardware.serial_mfc_worker import SerialPollingWorker
 from core.protocol.flowvision_model import FlowVisionScriptModel, HardwareConfig
 from core.session.session_manager import SessionManager
 from core.session.layout import SessionPaths
+from core.protocol.library import protocol_root, camera_presets
 from ui.styles.theme import SCIENTIFIC_QSS, apply_typography, set_device_status, flowvision_state
 from ui.tabs.tab_acquisition import AcquisitionTab
 from ui.tabs.tab_evaluation import UnifiedEvaluationTab
@@ -31,6 +32,16 @@ from ui.tabs.tab_tracking import TrackingTab
 from ui.widgets.layout_helpers import scroll_panel, install_window_centering
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+def application_icon():
+    """Load the shared transparent UI asset at native Windows icon sizes."""
+    pixmap = QPixmap(str(BASE_DIR / 'ui' / 'icon.png'))
+    icon = QIcon()
+    if not pixmap.isNull():
+        for size in (16, 24, 32, 48, 64, 128, 256):
+            icon.addPixmap(pixmap.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+    return icon
 
 
 @dataclass
@@ -47,6 +58,7 @@ class FATerApp(QMainWindow):
 
     def __init__(self, start_hardware=True):
         super().__init__()
+        self.setWindowIcon(application_icon())
         self._closing = False
         self._finishing = False
         self._recording: RecordingContext | None = None
@@ -54,7 +66,8 @@ class FATerApp(QMainWindow):
         self._camera_state = "Offline"
         self._camera_details = ""
         self.config = HardwareConfig()
-        self.config.pfs_path = str(BASE_DIR / self.config.pfs_path)
+        presets = camera_presets()
+        self.config.pfs_path = str(presets[0] if presets else protocol_root() / 'camera' / '12 chamber.pfs')
         self.session_mgr = SessionManager(str(BASE_DIR / "workspace"))
         self.serial_worker = SerialPollingWorker(
             port_name=self.config.fv_com_port,
@@ -109,7 +122,7 @@ class FATerApp(QMainWindow):
         layout.addLayout(status)
         self.tab_widget = QTabWidget()
         self.tab_protocol = ProtocolTab(
-            protocols_dir=str(BASE_DIR / "protocols"), parent=self,
+            protocols_dir=str(protocol_root()), parent=self,
         )
         self.tab_protocol.hardware_config = self.config
         self.tab_acquire = AcquisitionTab(parent=self)
@@ -164,7 +177,7 @@ class FATerApp(QMainWindow):
         )
         # Protocol plans and connection settings stay fixed during recording.
         self.tab_protocol.setEnabled(available and not busy)
-        for control in (acquire.txt_com_port, acquire.txt_pfs,
+        for control in (acquire.txt_com_port, acquire.txt_pfs, acquire.combo_camera_presets,
                         acquire.btn_browse_pfs, acquire.btn_reconnect_cam,
                         acquire.btn_release_port, acquire.btn_reconnect_serial):
             control.setEnabled(available and not busy)
@@ -421,7 +434,11 @@ def main():
     os.environ.setdefault("QT_SCALE_FACTOR", "1")
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    if sys.platform == 'win32':
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('FATer.Workbench')
     app = QApplication(sys.argv)
+    app.setWindowIcon(application_icon())
     install_window_centering(app)
     apply_typography(app)
     app.setStyleSheet(SCIENTIFIC_QSS)

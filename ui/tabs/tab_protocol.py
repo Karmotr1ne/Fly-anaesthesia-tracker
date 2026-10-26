@@ -23,6 +23,7 @@ from core.hardware.protocol_scheduler import ProtocolScheduler
 from core.protocol.flowvision_model import FlowVisionScriptModel
 
 from core.protocol.saturation_calculator import SaturationCalculator
+from core.protocol.library import protocol_root
 
 
 from ui.styles.theme import style_page
@@ -53,11 +54,7 @@ class ProtocolTab(QWidget):
     def __init__(self, protocols_dir: Optional[str] = None, parent: Optional[QWidget] = None, *args, **kwargs):
         super().__init__(parent)
 
-        if protocols_dir is not None:
-            self.protocols_dir = Path(protocols_dir)
-        else:
-            self.protocols_dir = Path("protocols")
-        self.protocols_dir.mkdir(parents=True, exist_ok=True)
+        self.protocols_dir = protocol_root(protocols_dir) / 'air valve'
 
         self.active_protocol_name = "Custom Protocol"
 
@@ -362,15 +359,21 @@ class ProtocolTab(QWidget):
     # Geometry & Dynamics Callbacks
     # -------------------------------------------------------------------------
     def _on_preset_changed(self, idx: int):
-        if idx == 0:
-            self.spin_rows.setValue(4)
-            self.spin_cols.setValue(3)
-        elif idx == 1:
-            self.spin_rows.setValue(4)
-            self.spin_cols.setValue(2)
-        elif idx == 2:
-            self.spin_rows.setValue(6)
-            self.spin_cols.setValue(4)
+        presets = {0: (4, 3), 1: (4, 2), 2: (6, 4)}
+        if idx not in presets:
+            return
+        rows, cols = presets[idx]
+        if (self.spin_rows.value(), self.spin_cols.value()) == (rows, cols):
+            return
+        controls = (self.spin_rows, self.spin_cols)
+        previous = [control.blockSignals(True) for control in controls]
+        try:
+            self.spin_rows.setValue(rows)
+            self.spin_cols.setValue(cols)
+        finally:
+            for control, blocked in zip(controls, previous):
+                control.blockSignals(blocked)
+        self._on_geometry_changed()
 
     def _on_geometry_changed(self):
         r = self.spin_rows.value()
@@ -525,13 +528,22 @@ class ProtocolTab(QWidget):
         self.list_protocols.clear()
         if not self.protocols_dir.exists():
             return
-        for file in sorted(self.protocols_dir.glob("*.fv")):
-            self.list_protocols.addItem(file.name)
+        files = sorted((path for path in self.protocols_dir.rglob('*')
+                        if path.is_file() and path.suffix.casefold() == '.fv'),
+                       key=lambda path: str(path.relative_to(self.protocols_dir)).casefold())
+        for file in files:
+            self.list_protocols.addItem(str(file.relative_to(self.protocols_dir)))
+            item = self.list_protocols.item(self.list_protocols.count() - 1)
+            item.setData(Qt.UserRole, str(file.resolve()))
+            item.setToolTip(str(file.resolve()))
 
     def _on_protocol_item_clicked(self, item):
-        file_path = self.protocols_dir / item.text()
+        file_path = Path(item.data(Qt.UserRole) or self.protocols_dir / item.text())
         if file_path.is_file():
-            self._load_protocol_from_file(file_path)
+            try:
+                self._load_protocol_from_file(file_path)
+            except (OSError, ValueError, TypeError) as exc:
+                QMessageBox.warning(self, 'Protocol Not Loaded', str(exc))
 
     def _load_protocol_from_file(self, file_path: Path):
         self.active_protocol_name = file_path.stem
@@ -552,7 +564,6 @@ class ProtocolTab(QWidget):
         self.active_protocol_name = "New Protocol"
         self.table.setRowCount(0)
         self._add_row(60.0, 200.0, 0.0, 0.0)
-        self._apply_calculated_flows()
         self.update_saturation_estimate()
 
     def _on_browse_directory(self):
@@ -562,8 +573,6 @@ class ProtocolTab(QWidget):
             self.populate_protocol_library()
 
     def _on_save_protocol(self):
-        if not self._apply_calculated_flows():
-            return
         try:
             steps = self._extract_steps()
         except (ValueError, TypeError) as exc:
@@ -595,8 +604,6 @@ class ProtocolTab(QWidget):
             QMessageBox.information(self, "Saved", f"Protocol successfully saved to:\n{p.name}")
 
     def _apply_protocol(self):
-        if not self._apply_calculated_flows():
-            return
         self.update_saturation_estimate()
         try:
             steps = self._extract_steps()
@@ -606,5 +613,4 @@ class ProtocolTab(QWidget):
         onset_sec = self.spin_onset.value()
 
         self.protocol_applied.emit(self.active_protocol_name, onset_sec, steps)
-        self.plate_geometry_changed.emit(self.spin_rows.value(), self.spin_cols.value())
 
