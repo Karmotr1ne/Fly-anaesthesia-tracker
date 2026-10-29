@@ -87,13 +87,13 @@ def _evaluate_with_overlay(source, params, *, plots=False, heatmaps=False,
 
 def evaluate_dataset(source, params, *, plots=False, heatmaps=False,
                      cancelled=None, output_dir=None, overlay_video=None,
-                     summary_only=False, progress=None, median_plot=False):
+                     summary_only=False, progress=None, angular_plot=False, component_plot=False, median_plot=False):
     """Bound analysis memory to one chamber; commit each video's CSVs separately.
 
     Return the small summary table, output path and optional plot warnings.
     """
     if overlay_video:
-        if median_plot:
+        if angular_plot or component_plot or median_plot:
             raise ValueError('Export the analysis plots separately from the CLI video overlay.')
         if summary_only:
             raise ValueError('Summary-only mode cannot export an overlay.')
@@ -171,7 +171,7 @@ def evaluate_dataset(source, params, *, plots=False, heatmaps=False,
             if not summary_only:
                 schema.write_csv(evaluated, evaluated_stage, mode='a', header=not written)
                 written = True
-            if not summary_only and (plots or heatmaps):
+            if not summary_only and (plots or heatmaps or angular_plot or component_plot):
                 if heatmaps:
                     # Aggregate before plot decimation: short steps retain all frames.
                     preference_statistics.extend(spatial_statistics(
@@ -188,6 +188,7 @@ def evaluate_dataset(source, params, *, plots=False, heatmaps=False,
         schema.write_csv(summary, transaction.stage(summary_path))
         if plot_parts:
             from .visualiser import ScientificVisualiser
+            from .directional_velocity import plot_velocity
             visualiser = ScientificVisualiser(analyser.fps)
             plot_data = pd.concat(plot_parts, ignore_index=True)
             plot_parts.clear()
@@ -199,6 +200,12 @@ def evaluate_dataset(source, params, *, plots=False, heatmaps=False,
                 figures.append((visualiser.plot_spatial_preferences, '_spatial_preferences.png',
                     dict(floor_height=params.floor_height, ceiling_height=params.ceiling_height,
                          windows=windows, statistics=preference_statistics)))
+            if angular_plot and component_plot:
+                figures.append((plot_velocity, '_directional_motion.png', dict(angular=None)))
+            elif angular_plot:
+                figures.append((plot_velocity, '_angular_velocity.png', dict(angular=True)))
+            elif component_plot:
+                figures.append((plot_velocity, '_component_velocity.png', dict(angular=False)))
             datasets = [('', plot_data)]
             for tag, frame in datasets:
                 for method, suffix, options in figures:
@@ -210,12 +217,17 @@ def evaluate_dataset(source, params, *, plots=False, heatmaps=False,
                         staged.unlink(missing_ok=True)
                         warnings.append(f'{tag}{suffix}: {exc}')
             if median_plot:
-                from .summary_plot import plot_boxplot_summary
+                from .directional_velocity import plot_boxplot_summary
                 fields = []
                 if plots:
                     fields.extend((('speed', 'Speed (px/s)'), ('position', 'Normalised height')))
                 if heatmaps and not plots:
                     fields.append(('position', 'Normalised height'))
+                if component_plot:
+                    fields.extend((('horizontal_velocity(px/s)', 'Horizontal (px/s)'),
+                                   ('vertical_velocity(px/s)', 'Vertical (px/s; up +)')))
+                if angular_plot:
+                    fields.append(('turning_angular_velocity(deg/s)', 'Turning (deg/s)'))
                 staged = transaction.stage(str(prefix) + '_boxplot_summary.png')
                 notify('Plotting box-and-whisker summary', .9)
                 try:
@@ -238,6 +250,7 @@ def evaluate_dataset(source, params, *, plots=False, heatmaps=False,
             input=str(source), analysis_id=analysis_id, boxplot_summary=median_plot, parameters=effective, plots=plots and not summary_only,
             heatmaps=heatmaps and not summary_only, summary_only=summary_only,
             storage='per_chamber_analysis; incremental_csv', warnings=warnings,
+            angular_plot=angular_plot, component_plot=component_plot,
             spatial_protocol_source=protocol_source, spatial_windows=windows,
             output=str(output), summary=str(summary_path)), indent=2), encoding='utf-8')
         notify('Saving complete video CSVs to Session', .95)
