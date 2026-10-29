@@ -177,7 +177,7 @@ class FATerApp(QMainWindow):
         )
         # Protocol plans and connection settings stay fixed during recording.
         self.tab_protocol.setEnabled(available and not busy)
-        for control in (acquire.txt_com_port, acquire.txt_pfs, acquire.combo_camera_presets,
+        for control in (acquire.txt_com_port, acquire.txt_pfs,
                         acquire.btn_browse_pfs, acquire.btn_reconnect_cam,
                         acquire.btn_release_port, acquire.btn_reconnect_serial):
             control.setEnabled(available and not busy)

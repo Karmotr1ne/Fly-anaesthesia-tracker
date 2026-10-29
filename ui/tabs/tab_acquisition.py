@@ -30,7 +30,7 @@ from PyQt5.QtWidgets import (
 from ui.widgets.video_viewport import AspectRatioVideoWidget
 
 from core.hardware.process_cleaner import clean_flowvision_processes
-from core.protocol.library import protocol_root, camera_presets
+from core.protocol.library import protocol_root
 from core.hardware.protocol_scheduler import DEVICE_MAP, ProtocolScheduler
 
 
@@ -107,7 +107,7 @@ class AcquisitionTab(QWidget):
             for label in self.tab_mfc.findChildren(QLabel, name):
                 label.setMinimumHeight(26)
         # Match control heights while retaining useful input and action lengths.
-        hardware_controls = (self.txt_pfs, self.combo_camera_presets, self.txt_com_port,
+        hardware_controls = (self.txt_pfs, self.txt_com_port,
                              self.btn_browse_pfs, self.btn_release_port,
                              self.btn_reconnect_cam, self.btn_reconnect_serial)
         for control in hardware_controls:
@@ -207,14 +207,6 @@ class AcquisitionTab(QWidget):
         self.txt_pfs = QLineEdit("12 chamber.pfs")
         self.txt_pfs.setMinimumWidth(0)
         grid_hw.addWidget(self.txt_pfs, 0, 1)
-        self.combo_camera_presets = QComboBox()
-        self.combo_camera_presets.addItem('Select Camera Preset...', '')
-        camera_dir = protocol_root() / 'camera'
-        for preset in camera_presets():
-            self.combo_camera_presets.addItem(str(preset.relative_to(camera_dir)), str(preset))
-        self.combo_camera_presets.activated.connect(self._select_camera_preset)
-        grid_hw.addWidget(QLabel('Camera Preset:'), 2, 0)
-        grid_hw.addWidget(self.combo_camera_presets, 2, 1, 1, 3)
 
         self.btn_browse_pfs = QPushButton("Browse...")
         self.btn_browse_pfs.setStyleSheet("background-color: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 4px; font-weight: 400;")
@@ -726,12 +718,6 @@ class AcquisitionTab(QWidget):
     def _choose_pfs(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Basler Camera Feature File", str(protocol_root() / 'camera'), "PFS Files (*.pfs);;All Files (*.*)")
         if path:
-            self.txt_pfs.setText(path)
-            self._apply_feature_path()
-
-    def _select_camera_preset(self, index):
-        path = self.combo_camera_presets.itemData(index)
-        if path and self.txt_pfs.isEnabled():
             self.txt_pfs.setText(path)
             self._apply_feature_path()
 
