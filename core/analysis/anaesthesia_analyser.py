@@ -103,8 +103,7 @@ class AnaesthesiaAnalyser:
         if prepared.empty: return prepared
         out = self._engine().evaluate_states(prepared, _prepared=True)
         out['behavioural_state'] = out["state"].map({"Active":"Active","Sedate":"Sedated","Anaesthesia":"Anaesthetised", "Unknown":"Unknown"})
-        from .directional_velocity import add_directional_velocity
-        return add_directional_velocity(out)
+        return out
     def evaluate_states(self, df, anaesthetic_onset=None):
         if anaesthetic_onset is not None: self.params.anaesthetic_onset = float(anaesthetic_onset)
         return self.process_dataframe(df)

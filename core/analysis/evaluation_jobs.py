@@ -10,7 +10,7 @@ class EvaluationWorker(QThread):
     result_ready = pyqtSignal(int, object, str)
     progress = pyqtSignal(int, str, float)
 
-    def __init__(self, tasks, onset, params=None, plots=False, heatmaps=False, summary_only=False, angular_plot=False, component_plot=False, median_plot=False):
+    def __init__(self, tasks, onset, params=None, plots=False, heatmaps=False, summary_only=False, median_plot=False):
         super().__init__()
         self.tasks = list(tasks)
         self.onset = onset
@@ -19,7 +19,6 @@ class EvaluationWorker(QThread):
         self.heatmaps = heatmaps
         self.median_plot = median_plot
         self.summary_only = summary_only
-        self.angular_plot, self.component_plot = angular_plot, component_plot
 
     def cancel(self):
         self.requestInterruption()
@@ -34,7 +33,7 @@ class EvaluationWorker(QThread):
                 summary, output, warnings = evaluate_dataset(
                     source, params, plots=self.plots, heatmaps=self.heatmaps,
                     cancelled=self.isInterruptionRequested, summary_only=self.summary_only,
-                    angular_plot=self.angular_plot, component_plot=self.component_plot, median_plot=self.median_plot,
+                    median_plot=self.median_plot,
                     progress=lambda text, fraction: self.progress.emit(index, text, fraction))
                 message = str(output) + ("; Plot warning: " + "; ".join(warnings) if warnings else "")
                 self.result_ready.emit(index, summary, message)

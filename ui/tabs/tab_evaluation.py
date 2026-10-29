@@ -311,12 +311,6 @@ class UnifiedEvaluationTab(QWidget):
         self.check_heatmaps.setStyleSheet("color: #334155; font-size: 12px; font-weight: 500;")
         v_exec.addWidget(self.check_heatmaps)
 
-        self.check_angular_velocity = QCheckBox("Directional Motion (Horizontal, Vertical, Turning)")
-        self.check_angular_velocity.setChecked(True)
-        self.check_angular_velocity.setToolTip("One shared-time figure with horizontal speed, vertical speed and turning rate panels.")
-        v_exec.addWidget(self.check_angular_velocity)
-        # Both service flags deliberately share the combined UI selection.
-        self.check_component_velocity = self.check_angular_velocity
         self.check_median_plot = QCheckBox("Summary Plot")
         self.check_median_plot.setToolTip("Time-binned chamber distributions: median, quartiles, 1.5 IQR whiskers and outliers.")
         self.check_median_plot.setStyleSheet(
@@ -549,12 +543,9 @@ class UnifiedEvaluationTab(QWidget):
             self.check_plots.isChecked(),
             self.check_heatmaps.isChecked(),
             self.check_summary_only.isChecked(),
-            self.check_angular_velocity.isChecked(), self.check_component_velocity.isChecked(),
             self.check_median_plot.isChecked()
         )
         self.check_median_plot.setEnabled(False)
-        self.check_angular_velocity.setEnabled(False)
-        self.check_component_velocity.setEnabled(False)
         self.check_summary_only.setEnabled(False)
         self.check_plots.setEnabled(False)
         self.check_heatmaps.setEnabled(False)
@@ -567,8 +558,6 @@ class UnifiedEvaluationTab(QWidget):
 
     def _summary_mode_changed(self, checked):
         self.check_median_plot.setEnabled(not checked)
-        self.check_angular_velocity.setEnabled(not checked)
-        self.check_component_velocity.setEnabled(not checked)
         self.check_plots.setEnabled(not checked)
         self.check_heatmaps.setEnabled(not checked)
 

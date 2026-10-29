@@ -93,7 +93,7 @@ workspace/sessions/Session_<timestamp>_<flow>Anes_<duration>s/
 - **输入 / Input** — `*_raw.csv` 是原始检测，`*_position.csv` 是清洗轨迹，评估优先使用后者。 / `*_raw.csv` contains raw detections; `*_position.csv` contains cleaned trajectories and is the preferred evaluation input.
 - **输出 / Output** — `*_evaluated.csv` 为逐帧评估，`*_summary.csv` 为汇总；追踪和评估参数保存在 `logs/`。 / `*_evaluated.csv` stores frame-level evaluation; `*_summary.csv` stores summaries. Tracking and evaluation settings are saved in `logs/`.
 - **命名 / Names** — 以实验时间 `YYYYMMDD_HHMMSS` 命名；每个视频完成即提交结果。集中提取的 Position CSV 在所在文件夹的 `analysis/` 输出结果。 / Files use the experiment timestamp; results commit per video. Extracted Position CSVs write to their folder's `analysis/` directory.
-- **图表 / Plots** — 方向运动图包含水平、竖直分速度与转向角速度；可额外输出箱线汇总图。 / Directional motion combines horizontal and vertical velocities with turning rate; optional box-and-whisker summaries are available.
+- **图表 / Plots** — 输出活动与位置、时空分布、生存曲线和分阶段位置偏好图；可额外输出箱线汇总图。 / Export activity and position, kymograph, survival and protocol-step spatial preference plots, with optional box-and-whisker summaries.
 - **默认流量 / Default flows** — 最大总流量下的 O2:N2 = 1:4 只在启动或更改腔室设计时应用；保存或应用 Protocol 保留表内流量。 / Maximum-flow O2:N2 defaults apply only at startup or geometry changes; Save and Apply preserve edited flows.
 - **单位 / Units** — 坐标为像素，速度为 **px/s**，高度阈值为归一化值；不能直接把速度当作 mm/s。 / Coordinates are in pixels, speed in **px/s**, and height thresholds are normalized; speed is not calibrated to mm/s.
 - **阈值 / Thresholds** — 评估引擎默认气体起始 300 s、静止窗口 120 s、静止速度 0.1 px/s；应按实际实验调整。缺失检测不等于静止。 / Engine defaults are 300 s gas onset, a 120 s stillness window and 0.1 px/s stillness speed; adjust to the experiment. Missing detections do not imply stillness.
