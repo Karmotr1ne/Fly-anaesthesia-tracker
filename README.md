@@ -36,9 +36,9 @@ python -m venv .venv
 .\.venv\Scripts\python.exe main.py --no-hardware
 ```
 
-新版使用 **PyQt5**。`--no-hardware` 跳过启动时的硬件连接，不生成模拟数据。实际采集另需安装相机驱动及硬件接口：
+新版使用 **PyQt5 5.15.11 / Qt 5.15.2 / PyQt5-sip 12.20.0**，版本固定在 `requirements.txt`。两份打包入口 `build.spec` 和 `buildexe.spec` 共用配置，使用 flytrack 中的 Python 执行 PyInstaller。`--no-hardware` 跳过启动时的硬件连接，不生成模拟数据。实际采集另需安装相机驱动及硬件接口：
 
-The current GUI uses **PyQt5**. `--no-hardware` skips hardware connections at startup; it does not generate simulated data. Acquisition additionally requires camera drivers and hardware interfaces:
+The GUI uses **PyQt5 5.15.11 / Qt 5.15.2 / PyQt5-sip 12.20.0**, pinned in `requirements.txt`. Both build entry points, `build.spec` and `buildexe.spec`, share their configuration; run PyInstaller with the flytrack Python interpreter. `--no-hardware` skips hardware connections at startup; it does not generate simulated data. Acquisition additionally requires camera drivers and hardware interfaces:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install pyserial pypylon
@@ -115,6 +115,6 @@ CLI 与桌面端使用同一评估服务 / CLI and GUI share the evaluation serv
 | 误识别或丢失 / False or missing detections | 检查 ROI、光照、背景采样和预览，再调整参数。 / Inspect ROIs, lighting, background sampling and previews before tuning parameters. |
 | Raw 未清洗 / Uncleaned Raw input | 先运行 Tracking，再使用 Position CSV 评估。 / Run Tracking first and evaluate the Position CSV. |
 
-已在本地进行完整硬件联调；然而正式实验前请检查代表性视频与输出结果。
+已进行完整硬件联调；然而正式实验前请检查代表性视频与输出结果。
 
 This programme has gone through hardware validation. Yet, inspect representative videos and outputs before running a full experimental batch.

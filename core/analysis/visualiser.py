@@ -1,9 +1,4 @@
-"""
-Module 5: Scientific Visualisation, Video Overlay & Report Engine
-=================================================================
-Generates publication-quality dual Y-axis dynamic plots, normalised space-time
-Kymographs, annotated video overlays, and structured statistical reports.
-"""
+'Headless activity, survival and protocol-step spatial preference figures.'
 from core import schema
 
 import os

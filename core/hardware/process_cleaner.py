@@ -1,4 +1,4 @@
-"""core/hardware/process_cleaner.py"""
+'Explicit release actions for external camera and FlowVision processes.'
 from __future__ import annotations
 from pathlib import Path
 import psutil

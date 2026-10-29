@@ -1,12 +1,4 @@
-"""
-ui/tabs/tab_acquisition.py
-Synchronized Acquisition Workbench for FATer.
-Modern Flat Redesign:
-- Completely removed heavy borders and nested outlines across the entire tab.
-- Completely restructured MFC Multi-Drop telemetry to eliminate widget clipping and overlapping.
-- Integrated video telemetry bar, compact hardware configuration, and synchronized session logs.
-- Fully compatible with FATer main.py signals.
-"""
+'Camera capture, gas-flow controls and synchronised session logging.'
 
 from __future__ import annotations
 

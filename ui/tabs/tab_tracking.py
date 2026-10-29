@@ -395,7 +395,7 @@ class TrackingTab(QWidget):
         return panel
 
     # =========================================================================
-    # 3. 业务绑定与逻辑控制器
+    # Session selection, calibration and tracking actions
     # =========================================================================
     def _bind_signals(self):
         for signal, slot in (

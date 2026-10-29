@@ -1,4 +1,4 @@
-"""core/session/session_manager.py"""
+'Create session folders and save acquisition settings before recording.'
 from __future__ import annotations
 
 import json

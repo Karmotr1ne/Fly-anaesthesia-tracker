@@ -203,6 +203,9 @@ class FATerApp(QMainWindow):
     def on_serial_status_changed(self, online, text):
         if self._closing:
             return
+        if text != getattr(self, '_last_serial_status', None):
+            self._last_serial_status = text
+            self.tab_acquire.log(text)
         self.serial_ready = online
         set_device_status(self.lbl_serial_status, "Air Valve", flowvision_state(online, text), text)
         self.tab_acquire.on_serial_status_changed(online, text)
@@ -429,7 +432,7 @@ class FATerApp(QMainWindow):
 
 
 def main():
-    # Scale fonts, inline styles, controls and fixed dimensions together.
+    # Let Qt handle display DPI without applying an extra application scale.
     # Keep an explicit user-supplied Qt scale factor when present.
     os.environ.setdefault("QT_SCALE_FACTOR", "1")
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)

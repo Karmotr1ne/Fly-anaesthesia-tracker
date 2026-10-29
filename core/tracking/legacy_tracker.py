@@ -186,7 +186,7 @@ class RobustFlyTracker:
             mask = cv2.bitwise_and(mask, b_mask)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel_close)
 
-        # 4. Rank contour centroids using temporal distance weighting.
+        # Extract contour features for appearance and continuity scoring.
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         candidates = []
 

@@ -1,17 +1,4 @@
-"""
-ui/tabs/tab_protocol.py
-Protocol designer and plate geometry configuration tab for FATer.
-
-Features:
-- Single-page compact layout (zero page overflow, properly scaled).
-- Plate Design at Top-Left (global geometry input).
-- Gas Saturation & Behaviour Safety: Relaxed max safe flow (< 18 cm/s) to prevent
-  fly freezing/shear-stress fear state while allowing high flow experiments.
-- Left-bottom: Compact Saved Protocol Library and File Storage (New, Browse, Save).
-- Right side: Row action buttons integrated tightly above the step table.
-- Full signal integration with main.py (protocol_applied, plate_geometry_changed).
-- Fully documented in English.
-"""
+'Chamber geometry, gas-flow estimates and saved protocol step editing.'
 
 from pathlib import Path
 from typing import List, Dict, Optional

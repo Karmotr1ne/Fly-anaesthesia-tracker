@@ -1,4 +1,4 @@
-# Time-binned chamber distribution plots.
+'Time-binned chamber distributions with quartiles and whiskers.'
 import numpy as np
 
 

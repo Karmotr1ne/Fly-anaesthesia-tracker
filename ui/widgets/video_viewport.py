@@ -1,4 +1,4 @@
-"""ui/widgets/video_viewport.py"""
+'Aspect-preserving video preview with cached Qt image conversion.'
 import cv2
 import numpy as np
 from PyQt5.QtCore import Qt
