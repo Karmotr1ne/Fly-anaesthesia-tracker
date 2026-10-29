@@ -50,7 +50,7 @@ SCALED_150_SCIENTIFIC_QSS = SCIENTIFIC_QSS
 
 
 def apply_typography(app):
-    """Register bundled IBM faces locally; never install fonts system-wide."""
+    """Use bundled IBM Plex Sans directly without enumerating system fonts."""
     from pathlib import Path
     from PyQt5.QtGui import QFont, QFontDatabase
 
@@ -59,10 +59,7 @@ def apply_typography(app):
         path = folder / name
         if path.is_file():
             QFontDatabase.addApplicationFont(str(path))
-    available = set(QFontDatabase().families())
-    family = next((name for name in ("IBM Plex Sans", "Calibri", "Segoe UI")
-                   if name in available), app.font().family())
-    font = QFont(family)
+    font = QFont("IBM Plex Sans")
     font.setPixelSize(12)
     font.setWeight(QFont.Normal)
     app.setFont(font)

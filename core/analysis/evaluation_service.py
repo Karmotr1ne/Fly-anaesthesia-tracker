@@ -6,6 +6,7 @@ import pandas as pd
 from core import schema
 from core.session.layout import OutputTransaction, SessionPaths, session_root, experiment_name
 from .anaesthesia_analyser import AnaesthesiaAnalyser
+from .spatial_preference import protocol_windows, spatial_statistics
 
 
 def _evaluate_with_overlay(source, params, *, plots=False, heatmaps=False,
@@ -38,6 +39,10 @@ def _evaluate_with_overlay(source, params, *, plots=False, heatmaps=False,
     prefix = Path(output_dir) / experiment_name(source)
     output = prefix.with_name(prefix.name + "_evaluated.csv")
     warnings = []
+    windows, protocol_source = None, None
+    if heatmaps:
+        windows, protocol_source, notes = protocol_windows(source)
+        warnings.extend(notes)
     with OutputTransaction(commit_root) as transaction:
         schema.write_csv(evaluated, transaction.stage(output))
         schema.write_csv(summary, transaction.stage(str(prefix) + "_summary.csv"))
@@ -53,7 +58,8 @@ def _evaluate_with_overlay(source, params, *, plots=False, heatmaps=False,
                     (visualiser.plot_survival_kinetics, summary, "_survival.png", {})))
             if heatmaps:
                 figures.append((visualiser.plot_spatial_preferences, evaluated, "_spatial_preferences.png",
-                    {"floor_height": params.floor_height, "ceiling_height": params.ceiling_height}))
+                    {"floor_height": params.floor_height, "ceiling_height": params.ceiling_height,
+                     "windows": windows}))
             for method, frame, suffix, options in figures:
                 check()
                 staged = transaction.stage(str(prefix) + suffix)
@@ -72,6 +78,7 @@ def _evaluate_with_overlay(source, params, *, plots=False, heatmaps=False,
         transaction.stage(metadata).write_text(json.dumps({
             "input": str(source), "parameters": effective,
             "plots": plots, "heatmaps": heatmaps, "warnings": warnings,
+            "spatial_protocol_source": protocol_source, "spatial_windows": windows,
             "output": str(output)}, indent=2), encoding="utf-8")
         check()
         transaction.commit(cancelled)
@@ -110,6 +117,11 @@ def evaluate_dataset(source, params, *, plots=False, heatmaps=False,
     warnings, summaries, chambers = [], [], {}
     rates = set()
     plot_parts = []
+    preference_statistics = []
+    windows, protocol_source = None, None
+    if heatmaps and not summary_only:
+        windows, protocol_source, notes = protocol_windows(source)
+        warnings.extend(notes)
 
     def notify(message, fraction):
         if cancelled and cancelled():
@@ -160,6 +172,10 @@ def evaluate_dataset(source, params, *, plots=False, heatmaps=False,
                 schema.write_csv(evaluated, evaluated_stage, mode='a', header=not written)
                 written = True
             if not summary_only and (plots or heatmaps or angular_plot or component_plot):
+                if heatmaps:
+                    # Aggregate before plot decimation: short steps retain all frames.
+                    preference_statistics.extend(spatial_statistics(
+                        evaluated, windows, analyser.fps, params.floor_height, params.ceiling_height))
                 # Plot bounded samples, preserving a panel for every chamber.
                 stride = max(1, (len(evaluated) + 9999) // 10000)
                 plot_parts.append(evaluated.iloc[::stride].copy())
@@ -182,7 +198,8 @@ def evaluate_dataset(source, params, *, plots=False, heatmaps=False,
                                 (visualiser.plot_kymograph_hexbin, '_kymograph.png', {})))
             if heatmaps:
                 figures.append((visualiser.plot_spatial_preferences, '_spatial_preferences.png',
-                    dict(floor_height=params.floor_height, ceiling_height=params.ceiling_height)))
+                    dict(floor_height=params.floor_height, ceiling_height=params.ceiling_height,
+                         windows=windows, statistics=preference_statistics)))
             if angular_plot and component_plot:
                 figures.append((plot_velocity, '_directional_motion.png', dict(angular=None)))
             elif angular_plot:
@@ -234,6 +251,7 @@ def evaluate_dataset(source, params, *, plots=False, heatmaps=False,
             heatmaps=heatmaps and not summary_only, summary_only=summary_only,
             storage='per_chamber_analysis; incremental_csv', warnings=warnings,
             angular_plot=angular_plot, component_plot=component_plot,
+            spatial_protocol_source=protocol_source, spatial_windows=windows,
             output=str(output), summary=str(summary_path)), indent=2), encoding='utf-8')
         notify('Saving complete video CSVs to Session', .95)
         transaction.commit(cancelled)

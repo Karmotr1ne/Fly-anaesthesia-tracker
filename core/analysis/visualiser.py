@@ -53,6 +53,20 @@ class ScientificVisualiser:
         if num_ch == 1:
             axes = [axes]
 
+        # Compare physical speeds directly: every chamber uses the same limits.
+        speeds = {}
+        speed_max = 0.0
+        for ch in chambers:
+            sub = cleaned_df.loc[cleaned_df['chamber_id'] == ch].sort_values('frame')
+            values = sub['speed'] if 'speed' in sub else pd.Series(0., index=sub.index)
+            smooth = values.replace([np.inf, -np.inf], np.nan).rolling(
+                window=15, min_periods=1, center=True).mean()
+            speeds[ch] = smooth.to_numpy()
+            finite = smooth[np.isfinite(smooth)]
+            if not finite.empty:
+                speed_max = max(speed_max, float(finite.max()))
+        speed_limit = max(speed_max * 1.15, 1.0)
+
         for i, ch in enumerate(chambers):
             ax_pos = axes[i]        # Position axis (Right)
             ax_act = ax_pos.twinx() # Activity axis (Left)
@@ -77,15 +91,14 @@ class ScientificVisualiser:
                     position = pd.Series(0.5, index=sub.index)
 
             # Activity / Smoothed Speed
-            speed_col = sub["speed"] if "speed" in sub.columns else pd.Series(0.0, index=sub.index)
-            smooth_speed = speed_col.rolling(window=15, min_periods=1, center=True).mean().fillna(0.0)
+            smooth_speed = speeds[ch]
 
             # 1. Plot Activity (Left axis - Cyan/Blue fill + line)
             ax_act.plot(time_sec, smooth_speed, color="#00A2E8", lw=1.2, label=schema.label("speed"), alpha=0.9)
             ax_act.fill_between(time_sec, 0, smooth_speed, color="#00A2E8", alpha=0.22)
             ax_act.set_ylabel(schema.label("speed"), color="#0083B8", fontweight="bold", fontsize=8.5)
             ax_act.tick_params(axis="y", labelcolor="#0083B8", labelsize=8)
-            ax_act.set_ylim(0, max(float(smooth_speed.max()) * 1.15, 60.0))
+            ax_act.set_ylim(0, speed_limit)
 
             # 2. Plot Vertical Position (Right axis - Crimson red line)
             ax_pos.plot(time_sec, position, color="#E53935", lw=1.6, label=schema.label("position"))
@@ -249,44 +262,51 @@ class ScientificVisualiser:
         plt.savefig(save_path, dpi=300)
         plt.close(fig)
 
-    def plot_spatial_preferences(self, data, save_path, floor_height=.05, ceiling_height=.95):
-        """Time-weighted height occupancy and floor/ceiling preference by chamber."""
-        data = schema.normalise(data)
-        height = "height" if "height" in data else "position"
-        chambers = sorted(data["chamber_id"].dropna().unique())
-        if not chambers:
+    def plot_spatial_preferences(self, data, save_path, floor_height=.05, ceiling_height=.95,
+                                 windows=None, statistics=None):
+        """All protocol steps in one figure, with identical colour scales."""
+        from .spatial_preference import spatial_statistics
+        if windows is None:
+            windows = [dict(label='Whole recording', start=None, end=None)]
+        if statistics is None:
+            statistics = spatial_statistics(data, windows, self.fps, floor_height, ceiling_height)
+        if not statistics:
             raise ValueError("No chambers available for spatial preference plots")
-        bins = np.linspace(0, 1, 41)
-        occupancy, preference = [], []
-        for chamber in chambers:
-            group = data.loc[data["chamber_id"] == chamber].sort_values("frame", kind="stable")
-            times = (group["time"] if "time" in group else group["frame"] / self.fps).to_numpy(float)
-            positions = group[height].to_numpy(float)
-            durations = np.diff(times, append=times[-1] + 1 / self.fps)
-            valid = np.isfinite(positions) & np.isfinite(durations) & (durations > 0)
-            positions, durations = np.clip(positions[valid], 0, 1), durations[valid]
-            total = durations.sum()
-            occupancy.append(np.histogram(positions, bins=bins, weights=durations)[0] * 100 / total
-                             if total else np.zeros(40))
-            preference.append([durations[positions <= floor_height].sum() * 100 / total,
-                               durations[positions >= ceiling_height].sum() * 100 / total]
-                              if total else [0, 0])
-        fig, axes = plt.subplots(1, 2, figsize=(11, max(3, len(chambers) * .35)),
+        statistics = sorted(statistics, key=lambda item: item[0])
+        chambers = [item[0] for item in statistics]
+        occupancy = np.stack([item[1] for item in statistics], axis=1)
+        preference = np.stack([item[2] for item in statistics], axis=1)
+        finite = occupancy[np.isfinite(occupancy)]
+        colour_max = max(1., float(finite.max())) if finite.size else 100.
+        palette = plt.get_cmap('Blues').copy()
+        palette.set_bad('#DDDDDD')
+        fig, axes = plt.subplots(len(windows), 2, squeeze=False,
+                                 figsize=(12, len(windows) * max(3, len(chambers) * .35 + 1)),
                                  gridspec_kw={"width_ratios": [4, 1]}, constrained_layout=True)
         try:
-            image = axes[0].imshow(occupancy, aspect="auto", origin="lower",
-                extent=(0, 1, -.5, len(chambers) - .5), cmap="Blues", vmin=0)
-            axes[0].set_xlabel("normalised height(0-1)")
-            axes[0].set_title("Height occupancy")
-            fig.colorbar(image, ax=axes[0], label="time proportion(%)")
-            image = axes[1].imshow(preference, aspect="auto", origin="lower", cmap="Blues", vmin=0, vmax=100)
-            axes[1].set_xticks([0, 1])
-            axes[1].set_xticklabels(["Floor", "Ceiling"])
-            axes[1].set_title("Spatial preference")
-            fig.colorbar(image, ax=axes[1], label="time proportion(%)")
-            for axis in axes:
-                axis.set_yticks(range(len(chambers)))
-                axis.set_yticklabels([f"CH {int(item)}" for item in chambers])
+            for index, window in enumerate(windows):
+                left, right = axes[index]
+                title = window['label']
+                if window['start'] is not None:
+                    title += f" | {window['start']:g}-{window['end']:g} s (planned)"
+                if 'flows' in window:
+                    flows = window['flows']
+                    title += (f"\nO2 {flows['o2']:g} | Anaesthetic {flows['anes']:g} | "
+                              f"N2 {flows['n2']:g} sccm")
+                height_image = left.imshow(occupancy[index], aspect="auto", origin="lower",
+                    extent=(0, 1, -.5, len(chambers) - .5), cmap=palette, vmin=0, vmax=colour_max)
+                left.set_xlabel("Normalised height (0 = bottom, 1 = top)")
+                left.set_title(title, fontsize=10)
+                preference_image = right.imshow(preference[index], aspect="auto", origin="lower",
+                                                cmap=palette, vmin=0, vmax=100)
+                right.set_xticks([0, 1], ["Floor", "Ceiling"])
+                right.set_title("Spatial preference", fontsize=10)
+                for axis in (left, right):
+                    axis.set_yticks(range(len(chambers)))
+                    axis.set_yticklabels([f"CH {item}" for item in chambers], fontsize=8)
+            fig.colorbar(height_image, ax=list(axes[:, 0]), label="Time per height bin (%)", shrink=.8)
+            fig.colorbar(preference_image, ax=list(axes[:, 1]), label="Time proportion (%)", shrink=.8)
+            fig.suptitle('Spatial preference by protocol step | Grey = no valid observations', fontsize=11)
             os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
             fig.savefig(save_path, dpi=200)
         finally:

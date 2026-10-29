@@ -303,7 +303,10 @@ class UnifiedEvaluationTab(QWidget):
         self.check_plots.setStyleSheet("color: #334155; font-size: 12px; font-weight: 500;")
         v_exec.addWidget(self.check_plots)
 
-        self.check_heatmaps = QCheckBox("Spatial Preference Heatmaps (Floor/Ceiling)")
+        self.check_heatmaps = QCheckBox("Spatial Preference by Protocol Step (Floor/Ceiling)")
+        self.check_heatmaps.setToolTip(
+            "Export all saved protocol steps in one figure, using planned step times from recording start. "
+            "Without a saved protocol, show the whole recording and report a warning.")
         self.check_heatmaps.setChecked(True)
         self.check_heatmaps.setStyleSheet("color: #334155; font-size: 12px; font-weight: 500;")
         v_exec.addWidget(self.check_heatmaps)

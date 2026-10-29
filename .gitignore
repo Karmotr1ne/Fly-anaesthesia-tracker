@@ -1,4 +1,5 @@
 /build.spec
+/buildexe.spec
 /dist/
 /build/
 __pycache__/

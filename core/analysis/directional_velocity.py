@@ -47,39 +47,34 @@ def add_directional_velocity(data):
 
 
 def plot_velocity(data, path, angular=False):
+    """One row per chamber, one column per metric, with shared physical scales."""
     import matplotlib.pyplot as plt
-    if angular is None:
-        fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
-        try:
-            fields = ('horizontal_velocity(px/s)', 'vertical_velocity(px/s)', 'turning_angular_velocity(deg/s)')
-            labels = ('Horizontal (px/s; right +)', 'Vertical (px/s; up +)', 'Turning (deg/s; CCW +)')
-            for ax, field, label in zip(axes, fields, labels):
-                for chamber, group in data.groupby('chamber_id'):
-                    ax.plot(group.time, group[field], linewidth=.7, label=f'CH{chamber}')
-                ax.axhline(0, color='grey', linewidth=.5)
-                ax.set_ylabel(label)
-            axes[0].legend(ncol=4, fontsize=8)
-            axes[-1].set_xlabel('Time (s)')
-            fig.tight_layout()
-            fig.savefig(path, dpi=160)
-        finally:
-            plt.close(fig)
-        return
-    fig, ax = plt.subplots(figsize=(12, 4))
+    fields = [('horizontal_velocity(px/s)', 'Horizontal (px/s; right +)', '#0083B8'),
+              ('vertical_velocity(px/s)', 'Vertical (px/s; up +)', '#E67E22'),
+              ('turning_angular_velocity(deg/s)', 'Turning (deg/s; CCW +)', '#8254A2')]
+    fields = fields if angular is None else fields[2:] if angular else fields[:2]
+    chambers = list(data.groupby('chamber_id', sort=True))
+    if not chambers:
+        raise ValueError('No chambers available for velocity plots.')
+    fig, axes = plt.subplots(len(chambers), len(fields), squeeze=False,
+                             figsize=(max(9, 4.5 * len(fields)), max(3, 2.2 * len(chambers))),
+                             sharex=True, sharey='col')
     try:
-        if angular:
-            for chamber, group in data.groupby('chamber_id'):
-                ax.plot(group.time, group['turning_angular_velocity(deg/s)'], linewidth=.7, label=f'CH{chamber}')
-            ax.legend()
-            ax.set_ylabel('Turning angular velocity (deg/s; CCW positive)')
-        else:
-            for chamber, group in data.groupby('chamber_id'):
-                ax.plot(group.time, group['horizontal_velocity(px/s)'], label=f'CH{chamber} horizontal', linewidth=.7)
-                ax.plot(group.time, group['vertical_velocity(px/s)'], label=f'CH{chamber} vertical (up positive)', linewidth=.7)
-            ax.set_ylabel('Velocity (px/s)')
-            ax.legend()
-        ax.axhline(0, color='grey', linewidth=.5)
-        ax.set_xlabel('Time (s)')
+        for row, (chamber, group) in enumerate(chambers):
+            group = group.sort_values('time', kind='stable')
+            for column, (field, label, colour) in enumerate(fields):
+                ax = axes[row, column]
+                values = group[field].to_numpy(float)
+                ax.plot(group.time, np.where(np.isfinite(values), values, np.nan),
+                        color=colour, linewidth=.7)
+                ax.axhline(0, color='grey', linewidth=.5)
+                ax.grid(alpha=.2)
+                if row == 0:
+                    ax.set_title(label, fontsize=10)
+                if column == 0:
+                    ax.set_ylabel(f'CH {int(chamber)}')
+                if row == len(chambers) - 1:
+                    ax.set_xlabel('Time (s)')
         fig.tight_layout()
         fig.savefig(path, dpi=160)
     finally:
